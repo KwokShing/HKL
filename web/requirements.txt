@@ -1,0 +1,8 @@
+requests==2.34.2
+beautifulsoup4==4.15.0
+pyquery==2.1.0
+pycryptodome==3.23.0
+cryptography==50.0.0
+lxml==6.1.1
+curl-cffi==0.16.0
+Pillow==12.3.0

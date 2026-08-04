@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>影片详情 · HKL Python Spider</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #090b12;
+      --panel: rgb(23 26 39 / 88%);
+      --panel-strong: #191d2b;
+      --line: rgb(255 255 255 / 9%);
+      --text: #f5f6fb;
+      --muted: #9aa0b5;
+      --accent: #7c6cf2;
+      --accent-2: #a45cf6;
+    }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    html { min-height: 100%; background: var(--bg); }
+    body {
+      min-height: 100vh;
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 12% 0%, rgb(93 72 210 / 18%), transparent 34rem),
+        radial-gradient(circle at 90% 12%, rgb(45 118 210 / 12%), transparent 30rem),
+        var(--bg);
+      font-family: Inter, "Segoe UI", system-ui, sans-serif;
+    }
+    button, a { font: inherit; }
+    button { cursor: pointer; }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      min-height: 68px;
+      padding: 12px max(24px, calc((100vw - 1440px) / 2 + 24px));
+      background: rgb(10 12 20 / 78%);
+      border-bottom: 1px solid var(--line);
+      box-shadow: 0 8px 30px rgb(0 0 0 / 18%);
+      backdrop-filter: blur(18px);
+    }
+    .back {
+      display: inline-flex;
+      align-items: center;
+      flex-shrink: 0;
+      padding: 9px 13px;
+      color: #dfe1ed;
+      text-decoration: none;
+      background: rgb(255 255 255 / 7%);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      transition: background .18s ease, transform .18s ease;
+    }
+    .back:hover { background: rgb(255 255 255 / 12%); transform: translateX(-2px); }
+    h1 { min-width: 0; margin: 0; overflow: hidden; font-size: clamp(18px, 2vw, 23px); text-overflow: ellipsis; white-space: nowrap; }
+    main { width: min(1440px, 100%); margin: 0 auto; padding: 32px 24px 48px; }
+    #loading, #error { padding: 42px 24px; color: var(--muted); text-align: center; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; }
+    #error { color: #ff9a9a; }
+    .playback-layout { display: grid; grid-template-columns: minmax(0, 1.9fr) minmax(350px, .9fr); gap: 24px; align-items: start; }
+    #player-panel {
+      min-width: 0;
+      padding: 10px 10px 14px;
+      background: linear-gradient(145deg, rgb(23 26 39 / 92%), rgb(13 15 24 / 96%));
+      border: 1px solid var(--line);
+      border-radius: 17px;
+      box-shadow: 0 24px 60px rgb(0 0 0 / 32%);
+    }
+    .video-stage { position: relative; width: 100%; max-height: 72vh; aspect-ratio: 16 / 9; overflow: hidden; background: #000; border-radius: 11px; box-shadow: inset 0 0 0 1px rgb(255 255 255 / 5%); }
+    #video-player { display: block; width: 100%; height: 100%; object-fit: contain; background: #000; }
+    #video-player.seek-loading::-webkit-media-controls-overlay-enclosure,
+    #video-player.seek-loading::-webkit-media-controls-overlay-play-button { display: none !important; }
+    .seek-loader { position: absolute; inset: 0; z-index: 2; display: grid; place-items: center; pointer-events: none; background: transparent; }
+    .seek-spinner { width: 48px; height: 48px; border: 3px solid rgb(255 255 255 / 28%); border-top-color: #fff; border-radius: 50%; filter: drop-shadow(0 2px 8px rgb(0 0 0 / 55%)); animation: seek-spin .8s linear infinite; }
+    @keyframes seek-spin { to { transform: rotate(360deg); } }
+    #now-playing { margin: 15px 6px 4px; overflow: hidden; color: #e8e9f2; font-size: 15px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+    #player-status { min-height: 20px; margin: 4px 6px 0; color: var(--muted); font-size: 13px; }
+    .playback-info { min-width: 0; padding: 20px; background: linear-gradient(160deg, rgb(29 33 49 / 94%), rgb(19 22 34 / 90%)); border: 1px solid var(--line); border-radius: 17px; box-shadow: 0 20px 50px rgb(0 0 0 / 24%); backdrop-filter: blur(14px); }
+    .summary { display: grid; grid-template-columns: 106px minmax(0, 1fr); gap: 16px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
+    .summary > div { min-width: 0; max-height: clamp(170px, 24vh, 240px); padding-right: 8px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+    #poster { width: 100%; aspect-ratio: 2 / 3; object-fit: cover; background: var(--panel-strong); border: 1px solid rgb(255 255 255 / 10%); border-radius: 11px; box-shadow: 0 10px 25px rgb(0 0 0 / 32%); }
+    .meta { margin: 0 0 8px; color: #c8cbd9; font-size: 13px; line-height: 1.5; }
+    #description { margin: 10px 0 0; color: var(--muted); font-size: 13px; line-height: 1.7; white-space: pre-wrap; }
+    .section-title { display: flex; align-items: center; gap: 8px; margin: 20px 0 11px; color: #eceefa; font-size: 15px; }
+    .playback-info .section-title::before { width: 4px; height: 14px; content: ""; background: linear-gradient(var(--accent), var(--accent-2)); border-radius: 4px; }
+    .episode-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .episode-header .section-title { margin-right: auto; }
+    .episode-sort { display: inline-flex; gap: 3px; padding: 3px; background: rgb(255 255 255 / 5%); border: 1px solid var(--line); border-radius: 9px; }
+    .sort-button { padding: 5px 9px; color: var(--muted); background: transparent; border: 0; border-radius: 6px; font-size: 12px; transition: color .16s ease, background .16s ease; }
+    .sort-button:hover { color: #fff; }
+    .sort-button.active { color: #fff; background: linear-gradient(135deg, var(--accent), var(--accent-2)); box-shadow: 0 4px 12px rgb(116 85 235 / 25%); }
+    #sources, #episodes { display: flex; flex-wrap: wrap; gap: 8px; }
+    #episodes { max-height: 250px; padding: 1px 4px 4px 1px; overflow: auto; }
+    .source-button, .episode-button { padding: 8px 12px; color: #d9dbe8; background: rgb(255 255 255 / 7%); border: 1px solid rgb(255 255 255 / 7%); border-radius: 9px; transition: color .16s ease, background .16s ease, border-color .16s ease, transform .16s ease; }
+    .source-button:hover, .episode-button:hover { color: #fff; background: rgb(255 255 255 / 12%); border-color: rgb(255 255 255 / 14%); transform: translateY(-1px); }
+    .source-button.active, .episode-button.active { color: #fff; background: linear-gradient(135deg, var(--accent), var(--accent-2)); border-color: transparent; box-shadow: 0 6px 18px rgb(116 85 235 / 32%); }
+    :focus-visible { outline: 2px solid #a99cff; outline-offset: 2px; }
+    .summary > div::-webkit-scrollbar, #episodes::-webkit-scrollbar { width: 7px; }
+    .summary > div::-webkit-scrollbar-thumb, #episodes::-webkit-scrollbar-thumb { background: #3f4355; border-radius: 10px; }
+    .summary > div::-webkit-scrollbar-track, #episodes::-webkit-scrollbar-track { background: rgb(255 255 255 / 3%); border-radius: 10px; }
+    @media (max-width: 1000px) {
+      .playback-layout { grid-template-columns: 1fr; }
+      .playback-info { padding: 18px; }
+      #description { max-height: none; }
+    }
+    @media (max-width: 680px) {
+      .topbar { min-height: 60px; padding: 10px 14px; }
+      .back { padding: 8px 10px; }
+      main { padding: 16px 12px 32px; }
+      .playback-layout { gap: 14px; }
+      #player-panel { padding: 6px 6px 12px; border-radius: 13px; }
+      #video-player { border-radius: 9px; }
+      .playback-info { padding: 15px; border-radius: 13px; }
+      .summary { grid-template-columns: 86px minmax(0, 1fr); gap: 12px; }
+      .source-button, .episode-button { padding: 8px 11px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar"><a class="back" href="/">← 返回片库</a><h1 id="title">影片详情</h1></header>
+  <main>
+    <div id="loading">正在加载详情……</div>
+    <div id="error" hidden></div>
+    <div id="content" hidden>
+      <div class="playback-layout">
+        <section id="player-panel">
+          <div class="video-stage">
+            <video id="video-player" controls playsinline></video>
+            <div id="seek-loader" class="seek-loader" role="status" aria-label="正在跳转播放位置" hidden>
+              <span class="seek-spinner" aria-hidden="true"></span>
+            </div>
+          </div>
+          <h2 id="now-playing" class="section-title">请选择片源和选集开始播放</h2>
+          <p id="player-status"></p>
+        </section>
+        <aside class="playback-info">
+          <section class="summary">
+            <img id="poster" alt="" referrerpolicy="no-referrer">
+            <div>
+              <p id="remark" class="meta"></p>
+              <p id="type" class="meta"></p>
+              <p id="people" class="meta"></p>
+              <p id="description"></p>
+            </div>
+          </section>
+          <h2 class="section-title">播放源</h2>
+          <div id="sources"></div>
+          <div class="episode-header">
+            <h2 class="section-title">选集</h2>
+            <div id="episode-sort" class="episode-sort" role="group" aria-label="选集排序">
+              <button class="sort-button active" type="button" data-order="asc" aria-pressed="true">正序</button>
+              <button class="sort-button" type="button" data-order="desc" aria-pressed="false">倒序</button>
+            </div>
+          </div>
+          <div id="episodes"></div>
+        </aside>
+      </div>
+    </div>
+  </main>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.16/dist/hls.min.js"></script>
+  <script>
+    const query = new URLSearchParams(location.search);
+    const state = {
+      site: query.get("site") || "",
+      vodId: query.get("vod_id") || "",
+      hls: null,
+      episodes: [],
+      episodeFlag: "",
+      episodeOrder: "asc",
+      activeEpisodeVid: "",
+      resumeAfterSeek: false,
+    };
+    const element = (id) => document.getElementById(id);
+    const loading = element("loading");
+    const errorElement = element("error");
+    const content = element("content");
+    const title = element("title");
+    const sourceElement = element("sources");
+    const episodeElement = element("episodes");
+    const playerPanel = element("player-panel");
+    const player = element("video-player");
+    const seekLoader = element("seek-loader");
+    const playerStatus = element("player-status");
+    let pointerDownWasPlaying = false;
+    let seekLoaderShownAt = 0;
+    let seekLoaderTimer = null;
+
+    async function fetchJson(path) {
+      const response = await fetch(path);
+      let result;
+      try { result = await response.json(); }
+      catch { throw new Error(`服务器返回了无效数据（HTTP ${response.status}）`); }
+      if (!response.ok) throw new Error(result.msg || result.error || `HTTP ${response.status}`);
+      return result;
+    }
+
+    function resumePlaybackAfterSeek() {
+      if (!state.resumeAfterSeek || player.readyState < 2) return;
+      state.resumeAfterSeek = false;
+      const playResult = player.play();
+      if (playResult) {
+        playResult.catch((error) => {
+          playerStatus.textContent = error?.name === "NotAllowedError"
+            ? "拖动完成，请点击播放器中的播放按钮"
+            : `恢复播放失败：${error?.message || mediaErrorMessage()}`;
+        });
+      }
+    }
+
+    function setPlayerLoading(loading) {
+      player.setAttribute("aria-busy", String(loading));
+    }
+
+    function setSeekLoading(loading, immediate = false) {
+      if (seekLoaderTimer) {
+        clearTimeout(seekLoaderTimer);
+        seekLoaderTimer = null;
+      }
+      if (loading) {
+        seekLoaderShownAt = performance.now();
+        seekLoader.hidden = false;
+        player.classList.add("seek-loading");
+        return;
+      }
+      const hide = () => {
+        seekLoader.hidden = true;
+        player.classList.remove("seek-loading");
+      };
+      const remaining = 180 - (performance.now() - seekLoaderShownAt);
+      if (immediate || remaining <= 0) hide();
+      else seekLoaderTimer = setTimeout(hide, remaining);
+    }
+
+    function stopPlayback() {
+      if (state.hls) { state.hls.destroy(); state.hls = null; }
+      state.resumeAfterSeek = false;
+      pointerDownWasPlaying = false;
+      setSeekLoading(false, true);
+      setPlayerLoading(false);
+      player.pause();
+      player.removeAttribute("src");
+      player.load();
+      element("now-playing").textContent = "请选择片源和选集开始播放";
+      playerStatus.textContent = "";
+    }
+
+    function markPlayerFrameReady() {
+      setSeekLoading(false);
+      setPlayerLoading(false);
+      resumePlaybackAfterSeek();
+    }
+
+    player.addEventListener("pointerdown", () => {
+      pointerDownWasPlaying = !player.paused && !player.ended;
+    }, true);
+
+    player.addEventListener("loadeddata", markPlayerFrameReady);
+    player.addEventListener("canplay", markPlayerFrameReady);
+    player.addEventListener("playing", markPlayerFrameReady);
+    player.addEventListener("seeking", () => {
+      if (!player.currentSrc || player.ended) return;
+      state.resumeAfterSeek = pointerDownWasPlaying || !player.paused;
+      pointerDownWasPlaying = false;
+      setSeekLoading(true);
+      setPlayerLoading(true);
+    });
+    player.addEventListener("seeked", () => {
+      if (player.readyState >= 2) markPlayerFrameReady();
+    });
+    player.addEventListener("waiting", () => {
+      if (player.currentSrc && !player.paused && !player.ended) setPlayerLoading(true);
+    });
+    player.addEventListener("stalled", () => {
+      if (player.currentSrc && !player.ended) setPlayerLoading(true);
+    });
+    player.addEventListener("error", () => {
+      setSeekLoading(false, true);
+      setPlayerLoading(false);
+    });
+    player.addEventListener("ended", () => setSeekLoading(false, true));
+
+    function renderDetail(detail) {
+      const name = detail.vod_name || "未知名称";
+      title.textContent = name;
+      document.title = `${name} · HKL Python Spider`;
+      element("poster").src = detail.vod_pic || "";
+      element("poster").alt = name;
+      element("remark").textContent = [detail.vod_remarks, detail.vod_year, detail.vod_area].filter(Boolean).join(" · ");
+      element("type").textContent = detail.type_name ? `类型：${detail.type_name}` : "";
+      const people = [];
+      if (detail.vod_director) people.push(`导演：${detail.vod_director}`);
+      if (detail.vod_actor) people.push(`演员：${detail.vod_actor}`);
+      element("people").textContent = people.join("\n");
+      element("description").textContent = detail.vod_content || "暂无简介";
+      loading.hidden = true;
+      content.hidden = false;
+      renderSources(Array.isArray(detail.sources) ? detail.sources : []);
+    }
+
+    function renderSources(sources) {
+      sourceElement.replaceChildren();
+      episodeElement.replaceChildren();
+      if (!sources.length) { sourceElement.textContent = "暂无可用播放源"; return; }
+      sources.forEach((source, index) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "source-button";
+        button.textContent = source.name || `片源 ${index + 1}`;
+        button.addEventListener("click", () => {
+          for (const item of sourceElement.children) item.classList.remove("active");
+          button.classList.add("active");
+          renderEpisodes(Array.isArray(source.episodes) ? source.episodes : [], source.flag || "");
+        });
+        sourceElement.append(button);
+      });
+      sourceElement.firstElementChild?.click();
+    }
+
+    function renderEpisodes(episodes, flag) {
+      stopPlayback();
+      state.episodes = [...episodes];
+      state.episodeFlag = flag;
+      state.activeEpisodeVid = "";
+      renderEpisodeButtons();
+    }
+
+    function renderEpisodeButtons() {
+      episodeElement.replaceChildren();
+      const episodes = state.episodeOrder === "desc" ? [...state.episodes].reverse() : state.episodes;
+      for (const episode of episodes) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "episode-button";
+        button.textContent = episode.name || "播放";
+        if (String(episode.vid ?? "") === state.activeEpisodeVid) button.classList.add("active");
+        button.addEventListener("click", () => playEpisode(episode, button, state.episodeFlag));
+        episodeElement.append(button);
+      }
+      episodeElement.scrollTop = 0;
+    }
+
+    function setEpisodeOrder(order) {
+      if (order !== "asc" && order !== "desc") return;
+      state.episodeOrder = order;
+      for (const button of element("episode-sort").querySelectorAll(".sort-button")) {
+        const active = button.dataset.order === order;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-pressed", String(active));
+      }
+      renderEpisodeButtons();
+    }
+
+    element("episode-sort").addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-order]");
+      if (button) setEpisodeOrder(button.dataset.order);
+    });
+
+    async function playEpisode(episode, button, flag) {
+      stopPlayback();
+      setPlayerLoading(true);
+      state.activeEpisodeVid = String(episode.vid ?? "");
+      playerPanel.hidden = false;
+      element("now-playing").textContent = `正在播放：${title.textContent} · ${episode.name || ""}`;
+      playerStatus.textContent = "正在解析播放地址……";
+      for (const item of episodeElement.children) item.classList.remove("active");
+      button.classList.add("active");
+      try {
+        const params = new URLSearchParams({ site: state.site, flag, vid: episode.vid });
+        const result = await fetchJson(`/api/player?${params}`);
+        await attachPlayback(result);
+      } catch (error) {
+        setPlayerLoading(false);
+        playerStatus.textContent = `播放失败：${error.message}。可以尝试其他片源。`;
+        console.error(error);
+      }
+    }
+
+    function mediaErrorMessage() {
+      const mediaError = player.error;
+      if (!mediaError) return "媒体加载失败";
+      const messages = {
+        1: "媒体加载被中止",
+        2: "媒体网络请求失败",
+        3: "媒体解码失败",
+        4: "浏览器不支持该媒体格式",
+      };
+      return mediaError.message || messages[mediaError.code] || `媒体错误 ${mediaError.code}`;
+    }
+
+    function waitForMediaReady(timeoutMs = 20000) {
+      return new Promise((resolve, reject) => {
+        let timer;
+        const cleanup = () => {
+          clearTimeout(timer);
+          player.removeEventListener("canplay", onReady);
+          player.removeEventListener("loadedmetadata", onReady);
+          player.removeEventListener("error", onError);
+        };
+        const onReady = () => { cleanup(); resolve(); };
+        const onError = () => { cleanup(); reject(new Error(mediaErrorMessage())); };
+        if (player.readyState >= 1) { resolve(); return; }
+        player.addEventListener("canplay", onReady, { once: true });
+        player.addEventListener("loadedmetadata", onReady, { once: true });
+        player.addEventListener("error", onError, { once: true });
+        timer = setTimeout(() => {
+          cleanup();
+          reject(new Error("等待媒体响应超时"));
+        }, timeoutMs);
+      });
+    }
+
+    function attachHls(url) {
+      return new Promise((resolve, reject) => {
+        const hls = state.hls = new window.Hls({ enableWorker: true });
+        let settled = false;
+        let mediaRecoveryAttempts = 0;
+        let networkRecoveryAttempts = 0;
+        let timer;
+        const finish = (error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (error) {
+            hls.destroy();
+            if (state.hls === hls) state.hls = null;
+            reject(error);
+          } else {
+            resolve();
+          }
+        };
+        timer = setTimeout(() => finish(new Error("等待首个 HLS 分片超时")), 30000);
+        hls.on(window.Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(url));
+        hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
+          playerStatus.textContent = "播放清单已加载，正在缓冲首个分片……";
+        });
+        hls.on(window.Hls.Events.FRAG_BUFFERED, () => finish());
+        hls.on(window.Hls.Events.ERROR, (_event, data) => {
+          if (!data.fatal) return;
+          if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveryAttempts < 1) {
+            mediaRecoveryAttempts += 1;
+            setPlayerLoading(true);
+            playerStatus.textContent = "检测到媒体解码异常，正在恢复……";
+            try {
+              hls.recoverMediaError();
+              return;
+            } catch {
+              // 继续执行统一失败处理。
+            }
+          }
+          if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR && networkRecoveryAttempts < 1) {
+            networkRecoveryAttempts += 1;
+            setPlayerLoading(true);
+            playerStatus.textContent = "媒体网络中断，正在重试……";
+            hls.startLoad();
+            return;
+          }
+          const code = data.response?.code ? `（HTTP ${data.response.code}）` : "";
+          const error = new Error(`HLS ${data.details || data.type || "加载失败"}${code}`);
+          if (!settled) {
+            finish(error);
+          } else {
+            setPlayerLoading(false);
+            playerStatus.textContent = `播放失败：${error.message}，请尝试其他片源`;
+            hls.destroy();
+            if (state.hls === hls) state.hls = null;
+          }
+        });
+        hls.attachMedia(player);
+      });
+    }
+
+    async function attachPlayback(result) {
+      const url = typeof result === "string" ? result : result?.url;
+      if (typeof url !== "string" || !url) throw new Error("没有取得播放地址");
+      setPlayerLoading(true);
+      const isHls = /\.m3u8(?:$|[?#])/i.test(url);
+      playerStatus.textContent = "正在加载媒体……";
+      if (isHls && player.canPlayType("application/vnd.apple.mpegurl")) {
+        player.src = url;
+        player.load();
+        await waitForMediaReady();
+      } else if (isHls && window.Hls?.isSupported()) {
+        await attachHls(url);
+      } else if (isHls) {
+        throw new Error("当前浏览器不支持 HLS 播放");
+      } else {
+        player.src = url;
+        player.load();
+        await waitForMediaReady();
+      }
+
+      playerStatus.textContent = "媒体已就绪";
+      try {
+        await player.play();
+        playerStatus.textContent = "";
+      } catch (error) {
+        if (error?.name === "NotAllowedError") {
+          setPlayerLoading(false);
+          playerStatus.textContent = "媒体已就绪，请点击播放器中的播放按钮";
+          return;
+        }
+        throw new Error(error?.message || mediaErrorMessage());
+      }
+    }
+
+    async function loadDetail() {
+      if (!state.site || !state.vodId) {
+        loading.hidden = true;
+        errorElement.hidden = false;
+        errorElement.textContent = "详情链接缺少数据源或影片 ID";
+        return;
+      }
+      try {
+        const params = new URLSearchParams({ site: state.site, vod_id: state.vodId });
+        renderDetail(await fetchJson(`/api/detail?${params}`));
+      } catch (error) {
+        loading.hidden = true;
+        errorElement.hidden = false;
+        errorElement.textContent = `详情加载失败：${error.message}`;
+        console.error(error);
+      }
+    }
+
+    window.addEventListener("pagehide", stopPlayback);
+    loadDetail();
+  </script>
+</body>
+</html>

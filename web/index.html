@@ -1,0 +1,671 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HKL Python Spider</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body {
+      margin: 0;
+      padding: 24px;
+      color: #fff;
+      background: #0f1015;
+      font-family: system-ui, sans-serif;
+    }
+    button, input, select { font: inherit; }
+    button { cursor: pointer; }
+    .site-picker { display: flex; align-items: center; gap: 8px; width: min(580px, 100%); min-width: min(460px, 100%); }
+    .site-controls { display: grid; grid-template-columns: minmax(140px, .75fr) minmax(200px, 1.25fr); gap: 8px; min-width: 0; flex: 1; }
+    #site-search, #site-select {
+      min-width: 0;
+      width: 100%;
+      padding: 10px 12px;
+      color: #fff;
+      background: #1b1d27;
+      border: 1px solid #353847;
+      border-radius: 8px;
+      outline: none;
+    }
+    #site-search:focus, #site-select:focus { border-color: #8174ef; }
+    #site-search::placeholder { color: #777b8d; }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+    }
+    h1 { margin: 0; }
+    #search-form { display: flex; gap: 8px; width: min(480px, 100%); }
+    #search-input {
+      min-width: 0;
+      flex: 1;
+      padding: 10px 14px;
+      color: #fff;
+      background: #1b1d27;
+      border: 1px solid #353847;
+      border-radius: 8px;
+      outline: none;
+    }
+    #search-input:focus { border-color: #8174ef; }
+    .primary, .secondary, .source-button, .episode-button {
+      padding: 9px 14px;
+      color: #fff;
+      background: #6c5ce7;
+      border: 0;
+      border-radius: 8px;
+    }
+    .secondary, .source-button, .episode-button { background: #292c38; }
+    .source-button.active, .episode-button.active { background: #6c5ce7; }
+    #status { min-height: 24px; margin-top: 18px; color: #aaa; }
+    #categories, #sources, #episodes {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+    }
+    #categories { margin: 14px 0 20px; }
+    #categories button {
+      flex-shrink: 0;
+      padding: 8px 16px;
+      color: #ddd;
+      background: #252733;
+      border: 0;
+      border-radius: 18px;
+    }
+    #categories button.active { color: #fff; background: #6c5ce7; }
+    #videos {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: 18px;
+    }
+    .card {
+      min-width: 0;
+      padding: 0;
+      overflow: hidden;
+      color: inherit;
+      text-align: left;
+      background: #1b1d27;
+      border: 1px solid transparent;
+      border-radius: 10px;
+      transition: transform .15s ease, border-color .15s ease;
+    }
+    .card:hover, .card:focus-visible { transform: translateY(-3px); border-color: #8174ef; }
+    .card img {
+      display: block;
+      width: 100%;
+      aspect-ratio: 2 / 3;
+      object-fit: cover;
+      background: #292c38;
+    }
+    .info { padding: 10px; }
+    .title, .remark { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .title { font-size: 15px; font-weight: 600; }
+    .remark { margin-top: 6px; color: #aaa; font-size: 12px; }
+    #load-more { display: block; margin: 24px auto 0; }
+    dialog {
+      width: min(1000px, calc(100% - 32px));
+      max-height: calc(100vh - 32px);
+      padding: 0;
+      overflow: auto;
+      color: #fff;
+      background: #171923;
+      border: 1px solid #353847;
+      border-radius: 14px;
+    }
+    dialog::backdrop { background: rgb(0 0 0 / 78%); }
+    .dialog-header {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 18px;
+      background: #171923;
+      border-bottom: 1px solid #2a2d3a;
+    }
+    .dialog-header h2 { margin: 0; font-size: 20px; }
+    #detail-close {
+      width: 36px;
+      height: 36px;
+      color: #fff;
+      background: #292c38;
+      border: 0;
+      border-radius: 50%;
+    }
+    #detail-loading { padding: 28px; color: #aaa; }
+    #detail-content { padding: 20px; }
+    .detail-summary { display: grid; grid-template-columns: 180px 1fr; gap: 22px; }
+    #detail-poster {
+      width: 100%;
+      aspect-ratio: 2 / 3;
+      object-fit: cover;
+      background: #292c38;
+      border-radius: 9px;
+    }
+    .detail-meta { margin: 0 0 8px; color: #c5c7d2; }
+    #detail-description { color: #aaa; line-height: 1.7; white-space: pre-wrap; }
+    .section-title { margin: 22px 0 10px; font-size: 16px; }
+    #sources, #episodes { flex-wrap: wrap; overflow: visible; }
+    .source-button, .episode-button { flex-shrink: 0; }
+    #player-panel { margin-top: 22px; }
+    #video-player { width: 100%; max-height: 70vh; background: #000; border-radius: 8px; }
+    #player-status { min-height: 22px; color: #aaa; }
+    .empty { grid-column: 1 / -1; padding: 50px 0; color: #888; text-align: center; }
+    @media (max-width: 680px) {
+      body { padding: 16px; }
+      .topbar { align-items: stretch; flex-direction: column; }
+      #search-form { width: 100%; }
+      #videos { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+      .detail-summary { grid-template-columns: 110px 1fr; gap: 14px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>HKL Python Spider</h1>
+    <div class="site-picker">
+      <label for="site-search">数据源</label>
+      <div class="site-controls">
+        <input id="site-search" type="search" maxlength="80" placeholder="搜索数据源名称" autocomplete="off" spellcheck="false" disabled>
+        <select id="site-select" aria-label="选择数据源" disabled>
+          <option>正在扫描 py 目录……</option>
+        </select>
+      </div>
+    </div>
+    <form id="search-form" role="search">
+      <input id="search-input" type="search" maxlength="80" placeholder="搜索影片" autocomplete="off">
+      <button class="primary" type="submit">搜索</button>
+      <button id="search-clear" class="secondary" type="button" hidden>清除</button>
+    </form>
+  </header>
+  <div id="status">正在加载……</div>
+  <nav id="categories" aria-label="影片分类"></nav>
+  <main id="videos"></main>
+  <button id="load-more" class="secondary" type="button" hidden>加载更多</button>
+
+  <dialog id="detail-dialog">
+    <header class="dialog-header">
+      <h2 id="detail-title">影片详情</h2>
+      <button id="detail-close" type="button" aria-label="关闭">✕</button>
+    </header>
+    <div id="detail-loading">正在加载详情……</div>
+    <div id="detail-content" hidden>
+      <section class="detail-summary">
+        <img id="detail-poster" alt="" referrerpolicy="no-referrer">
+        <div>
+          <p id="detail-remark" class="detail-meta"></p>
+          <p id="detail-type" class="detail-meta"></p>
+          <p id="detail-people" class="detail-meta"></p>
+          <p id="detail-description"></p>
+        </div>
+      </section>
+      <h3 class="section-title">播放源</h3>
+      <div id="sources"></div>
+      <h3 class="section-title">选集</h3>
+      <div id="episodes"></div>
+      <section id="player-panel" hidden>
+        <h3 id="now-playing" class="section-title"></h3>
+        <video id="video-player" controls playsinline></video>
+        <p id="player-status"></p>
+      </section>
+    </div>
+  </dialog>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.16/dist/hls.min.js"></script>
+  <script>
+    const statusElement = document.querySelector("#status");
+    const siteSearch = document.querySelector("#site-search");
+    const siteSelect = document.querySelector("#site-select");
+    const categoryElement = document.querySelector("#categories");
+    const videoElement = document.querySelector("#videos");
+    const loadMoreButton = document.querySelector("#load-more");
+    const searchForm = document.querySelector("#search-form");
+    const searchInput = document.querySelector("#search-input");
+    const searchClear = document.querySelector("#search-clear");
+    const detailDialog = document.querySelector("#detail-dialog");
+    const detailLoading = document.querySelector("#detail-loading");
+    const detailContent = document.querySelector("#detail-content");
+    const detailTitle = document.querySelector("#detail-title");
+    const detailPoster = document.querySelector("#detail-poster");
+    const detailRemark = document.querySelector("#detail-remark");
+    const detailType = document.querySelector("#detail-type");
+    const detailPeople = document.querySelector("#detail-people");
+    const detailDescription = document.querySelector("#detail-description");
+    const sourceElement = document.querySelector("#sources");
+    const episodeElement = document.querySelector("#episodes");
+    const playerPanel = document.querySelector("#player-panel");
+    const player = document.querySelector("#video-player");
+    const nowPlaying = document.querySelector("#now-playing");
+    const playerStatus = document.querySelector("#player-status");
+
+    const state = {
+      site: "",
+      plugins: [],
+      mode: "category",
+      value: "",
+      label: "",
+      page: 0,
+      hasMore: false,
+      loading: false,
+      count: 0,
+      requestId: 0,
+      hls: null,
+    };
+
+    async function fetchJson(path) {
+      const response = await fetch(path);
+      let result;
+      try {
+        result = await response.json();
+      } catch {
+        throw new Error(`服务器返回了无效数据（HTTP ${response.status}）`);
+      }
+      if (!response.ok) {
+        throw new Error(result.msg || result.error || `HTTP ${response.status}`);
+      }
+      return result;
+    }
+
+    function setActiveCategory(typeId) {
+      for (const button of categoryElement.children) {
+        button.classList.toggle("active", button.dataset.typeId === typeId);
+      }
+    }
+
+    function createVideoCard(video) {
+      const card = document.createElement("a");
+      const params = new URLSearchParams({
+        site: state.site,
+        vod_id: String(video.vod_id),
+      });
+      card.href = `/detail.html?${params}`;
+      card.target = "_blank";
+      card.rel = "noopener noreferrer";
+      card.className = "card";
+      card.style.textDecoration = "none";
+      card.setAttribute("aria-label", `在新页面打开 ${video.vod_name || "影片详情"}`);
+
+      const image = document.createElement("img");
+      image.src = video.vod_pic || "";
+      image.alt = video.vod_name || "";
+      image.loading = "lazy";
+      image.referrerPolicy = "no-referrer";
+
+      const info = document.createElement("div");
+      info.className = "info";
+      const title = document.createElement("div");
+      title.className = "title";
+      title.textContent = video.vod_name || "未知名称";
+      const remark = document.createElement("div");
+      remark.className = "remark";
+      remark.textContent = video.vod_remarks || video.vod_year || video.type_name || "";
+      info.append(title, remark);
+      card.append(image, info);
+      return card;
+    }
+
+    function renderVideos(videos, append) {
+      if (!append) {
+        videoElement.replaceChildren();
+        state.count = 0;
+      }
+      for (const video of videos) {
+        if (video.vod_id !== null && video.vod_id !== undefined) {
+          videoElement.append(createVideoCard(video));
+          state.count += 1;
+        }
+      }
+      if (state.count === 0) {
+        const empty = document.createElement("p");
+        empty.className = "empty";
+        empty.textContent = "没有找到影片";
+        videoElement.append(empty);
+      }
+    }
+
+    async function loadListing(page = 1, append = false) {
+      if (state.loading || !state.value) return;
+      const requestId = ++state.requestId;
+      state.loading = true;
+      loadMoreButton.disabled = true;
+      statusElement.textContent = append ? "正在加载更多……" : "正在加载影片……";
+
+      const params = new URLSearchParams({ site: state.site, page: String(page) });
+      const endpoint = state.mode === "search" ? "/api/search" : "/api/category";
+      params.set(state.mode === "search" ? "wd" : "type_id", state.value);
+      try {
+        const result = await fetchJson(`${endpoint}?${params}`);
+        if (requestId !== state.requestId) return;
+        renderVideos(Array.isArray(result.items) ? result.items : [], append);
+        state.page = result.page || page;
+        state.hasMore = Boolean(result.has_more);
+        const label = state.mode === "search" ? `搜索“${state.value}”` : state.label;
+        statusElement.textContent = `${label} · 已加载 ${state.count} 个项目`;
+        loadMoreButton.hidden = !state.hasMore;
+      } catch (error) {
+        if (requestId !== state.requestId) return;
+        if (!append) renderVideos([], false);
+        statusElement.textContent = `加载失败：${error.message}`;
+        loadMoreButton.hidden = true;
+        console.error(error);
+      } finally {
+        if (requestId === state.requestId) {
+          state.loading = false;
+          loadMoreButton.disabled = false;
+        }
+      }
+    }
+
+    function selectCategory(typeId, typeName) {
+      state.requestId += 1;
+      state.loading = false;
+      state.mode = "category";
+      state.value = typeId;
+      state.label = typeName;
+      state.page = 0;
+      state.hasMore = false;
+      searchClear.hidden = true;
+      searchInput.value = "";
+      setActiveCategory(typeId);
+      loadMoreButton.hidden = true;
+      loadListing();
+    }
+
+    function renderCategories(categories, homeItems) {
+      categoryElement.replaceChildren();
+      for (const category of categories) {
+        const typeId = String(category.type_id ?? "").trim();
+        const typeName = String(category.type_name || "").trim();
+        if (!typeId || !typeName) continue;
+        const button = document.createElement("button");
+        button.type = "button";
+        button.dataset.typeId = typeId;
+        button.dataset.typeName = typeName;
+        button.textContent = typeName;
+        button.addEventListener("click", () => selectCategory(typeId, typeName));
+        categoryElement.append(button);
+      }
+      if (categoryElement.firstElementChild) {
+        categoryElement.firstElementChild.click();
+      } else {
+        renderVideos(homeItems, false);
+        statusElement.textContent = `首页 · 已加载 ${state.count} 个项目`;
+      }
+    }
+
+    async function loadHome() {
+      if (!state.site) return;
+      statusElement.textContent = `正在加载 ${siteSelect.selectedOptions[0]?.textContent || "数据源"}……`;
+      categoryElement.replaceChildren();
+      videoElement.replaceChildren();
+      loadMoreButton.hidden = true;
+      try {
+        const params = new URLSearchParams({ site: state.site });
+        const result = await fetchJson(`/api/home?${params}`);
+        const categories = Array.isArray(result.categories) ? result.categories : [];
+        const items = Array.isArray(result.items) ? result.items : [];
+        if (categories.length === 0 && items.length === 0) {
+          throw new Error("插件首页没有返回分类或影片");
+        }
+        renderCategories(categories, items);
+      } catch (error) {
+        statusElement.textContent = `加载失败：${error.message}`;
+        console.error(error);
+      }
+    }
+
+    function pluginOptionText(plugin) {
+      const suffix = plugin.error
+        ? " [语法错误]"
+        : plugin.missing?.length
+          ? ` [缺少 ${plugin.missing.join(", ")}]`
+          : "";
+      return `${plugin.name}${suffix}`;
+    }
+
+    function renderPluginOptions(query = "") {
+      const keyword = query.trim().normalize("NFKC").toLocaleLowerCase();
+      const matches = state.plugins.filter((plugin) => {
+        const searchable = `${plugin.name || ""} ${plugin.id || ""}`.normalize("NFKC").toLocaleLowerCase();
+        return !keyword || searchable.includes(keyword);
+      });
+      const visible = [...matches];
+      const current = state.plugins.find((plugin) => plugin.id === state.site);
+      if (current && !visible.some((plugin) => plugin.id === current.id)) visible.unshift(current);
+
+      siteSelect.replaceChildren();
+      for (const plugin of visible) {
+        const option = document.createElement("option");
+        option.value = plugin.id;
+        const isCurrentOnly = keyword && plugin.id === state.site && !matches.some((item) => item.id === plugin.id);
+        option.textContent = `${pluginOptionText(plugin)}${isCurrentOnly ? " [当前]" : ""}`;
+        siteSelect.append(option);
+      }
+      if (keyword && matches.length === 0) {
+        const empty = document.createElement("option");
+        empty.disabled = true;
+        empty.textContent = `没有匹配“${query.trim()}”的数据源`;
+        siteSelect.append(empty);
+      }
+      if (state.site && visible.some((plugin) => plugin.id === state.site)) siteSelect.value = state.site;
+      siteSelect.disabled = state.plugins.length === 0;
+    }
+
+    async function loadPlugins() {
+      try {
+        const result = await fetchJson("/api/plugins");
+        const plugins = Array.isArray(result.plugins) ? result.plugins : [];
+        if (plugins.length === 0) throw new Error("py 目录中没有插件");
+        state.plugins = plugins;
+        const preferred = plugins.find((plugin) => plugin.id === "布布追剧.py") || plugins[0];
+        state.site = preferred.id;
+        renderPluginOptions();
+        siteSelect.value = preferred.id;
+        siteSearch.disabled = false;
+        await loadHome();
+      } catch (error) {
+        statusElement.textContent = `插件扫描失败：${error.message}`;
+        console.error(error);
+      }
+    }
+
+    siteSearch.addEventListener("input", () => {
+      renderPluginOptions(siteSearch.value);
+    });
+
+    siteSearch.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      siteSearch.value = "";
+      renderPluginOptions();
+    });
+
+    siteSelect.addEventListener("change", () => {
+      const nextSite = siteSelect.value;
+      if (!nextSite) return;
+      state.site = nextSite;
+      siteSearch.value = "";
+      renderPluginOptions();
+      siteSelect.value = nextSite;
+      stopPlayback();
+      state.requestId += 1;
+      state.loading = false;
+      state.value = "";
+      state.label = "";
+      searchInput.value = "";
+      searchClear.hidden = true;
+      loadHome();
+    });
+
+    searchForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const keyword = searchInput.value.trim();
+      if (!keyword) return;
+      state.requestId += 1;
+      state.loading = false;
+      state.mode = "search";
+      state.value = keyword;
+      state.page = 0;
+      state.hasMore = false;
+      setActiveCategory("");
+      searchClear.hidden = false;
+      loadMoreButton.hidden = true;
+      loadListing();
+    });
+
+    searchClear.addEventListener("click", () => {
+      const firstCategory = categoryElement.firstElementChild;
+      if (firstCategory) selectCategory(firstCategory.dataset.typeId, firstCategory.dataset.typeName);
+    });
+
+    loadMoreButton.addEventListener("click", () => {
+      if (state.hasMore) loadListing(state.page + 1, true);
+    });
+
+    function stopPlayback() {
+      if (state.hls) {
+        state.hls.destroy();
+        state.hls = null;
+      }
+      player.pause();
+      player.removeAttribute("src");
+      player.load();
+      playerPanel.hidden = true;
+      playerStatus.textContent = "";
+    }
+
+    function showDetailDialog() {
+      if (!detailDialog.open) detailDialog.showModal();
+    }
+
+    async function loadDetail(vodId) {
+      if (vodId === null || vodId === undefined || vodId === "") return;
+      stopPlayback();
+      detailTitle.textContent = "影片详情";
+      detailLoading.textContent = "正在加载详情……";
+      detailLoading.hidden = false;
+      detailContent.hidden = true;
+      sourceElement.replaceChildren();
+      episodeElement.replaceChildren();
+      showDetailDialog();
+      try {
+        const params = new URLSearchParams({ site: state.site, vod_id: String(vodId) });
+        const detail = await fetchJson(`/api/detail?${params}`);
+        renderDetail(detail);
+      } catch (error) {
+        detailLoading.textContent = `详情加载失败：${error.message}`;
+        console.error(error);
+      }
+    }
+
+    function renderDetail(detail) {
+      detailTitle.textContent = detail.vod_name || "未知名称";
+      detailPoster.src = detail.vod_pic || "";
+      detailPoster.alt = detail.vod_name || "";
+      detailRemark.textContent = [detail.vod_remarks, detail.vod_year, detail.vod_area]
+        .filter(Boolean).join(" · ");
+      detailType.textContent = detail.type_name ? `类型：${detail.type_name}` : "";
+      const people = [];
+      if (detail.vod_director) people.push(`导演：${detail.vod_director}`);
+      if (detail.vod_actor) people.push(`演员：${detail.vod_actor}`);
+      detailPeople.textContent = people.join("\n");
+      detailDescription.textContent = detail.vod_content || "暂无简介";
+      detailLoading.hidden = true;
+      detailContent.hidden = false;
+      renderSources(Array.isArray(detail.sources) ? detail.sources : []);
+    }
+
+    function renderSources(sources) {
+      sourceElement.replaceChildren();
+      episodeElement.replaceChildren();
+      if (sources.length === 0) {
+        const message = document.createElement("span");
+        message.textContent = "暂无可用播放源";
+        sourceElement.append(message);
+        return;
+      }
+      sources.forEach((source, index) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "source-button";
+        button.textContent = source.name || `片源 ${index + 1}`;
+        button.addEventListener("click", () => {
+          for (const item of sourceElement.children) item.classList.remove("active");
+          button.classList.add("active");
+          renderEpisodes(Array.isArray(source.episodes) ? source.episodes : [], source.flag || "");
+        });
+        sourceElement.append(button);
+      });
+      sourceElement.firstElementChild?.click();
+    }
+
+    function renderEpisodes(episodes, flag) {
+      stopPlayback();
+      episodeElement.replaceChildren();
+      for (const episode of episodes) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "episode-button";
+        button.textContent = episode.name || "播放";
+        button.addEventListener("click", () => playEpisode(episode, button, flag));
+        episodeElement.append(button);
+      }
+    }
+
+    async function playEpisode(episode, button, flag) {
+      stopPlayback();
+      playerPanel.hidden = false;
+      nowPlaying.textContent = `正在播放：${detailTitle.textContent} · ${episode.name || ""}`;
+      playerStatus.textContent = "正在解析播放地址……";
+      for (const item of episodeElement.children) item.classList.remove("active");
+      button.classList.add("active");
+      try {
+        const params = new URLSearchParams({
+          site: state.site,
+          flag,
+          vid: episode.vid,
+        });
+        const result = await fetchJson(`/api/player?${params}`);
+        await attachPlayback(result.url);
+      } catch (error) {
+        playerStatus.textContent = `播放失败：${error.message}。可以尝试其他片源。`;
+        console.error(error);
+      }
+    }
+
+    async function attachPlayback(url) {
+      if (typeof url !== "string" || !url) throw new Error("没有取得播放地址");
+      const isHls = /\.m3u8(?:$|[?#])/i.test(url);
+      if (isHls && player.canPlayType("application/vnd.apple.mpegurl")) {
+        player.src = url;
+      } else if (isHls && window.Hls?.isSupported()) {
+        state.hls = new window.Hls();
+        state.hls.loadSource(url);
+        state.hls.attachMedia(player);
+        state.hls.on(window.Hls.Events.ERROR, (_event, data) => {
+          if (data.fatal) playerStatus.textContent = "视频流加载失败，请尝试其他片源";
+        });
+      } else {
+        player.src = url;
+      }
+      playerStatus.textContent = "播放地址已加载";
+      try {
+        await player.play();
+        playerStatus.textContent = "";
+      } catch {
+        playerStatus.textContent = "播放地址已加载，请点击播放器中的播放按钮";
+      }
+    }
+
+    document.querySelector("#detail-close").addEventListener("click", () => detailDialog.close());
+    detailDialog.addEventListener("close", stopPlayback);
+    detailDialog.addEventListener("click", (event) => {
+      if (event.target === detailDialog) detailDialog.close();
+    });
+
+    loadPlugins();
+  </script>
+</body>
+</html>
