@@ -166,12 +166,14 @@
     </div>
   </main>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.16/dist/hls.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dashjs@5.2.0/dist/modern/umd/dash.all.min.js"></script>
   <script>
     const query = new URLSearchParams(location.search);
     const state = {
       site: query.get("site") || "",
       vodId: query.get("vod_id") || "",
       hls: null,
+      dash: null,
       episodes: [],
       episodeFlag: "",
       episodeOrder: "asc",
@@ -257,6 +259,10 @@
 
     function stopPlayback() {
       if (state.hls) { state.hls.destroy(); state.hls = null; }
+      if (state.dash) {
+        try { state.dash.reset(); } catch { /* 播放器可能尚未完成初始化。 */ }
+        state.dash = null;
+      }
       state.resumeAfterSeek = false;
       pointerDownWasPlaying = false;
       setSeekLoading(false, true);
@@ -419,6 +425,7 @@
         reportPlayerLog("player-api-result", {
           mode: result?.mode,
           isHls: result?.is_hls,
+          isDash: result?.is_dash,
           proxied: result?.proxied,
           hasUrl: Boolean(result?.url),
         });
@@ -462,6 +469,33 @@
           reject(new Error("等待媒体响应超时"));
         }, timeoutMs);
       });
+    }
+
+    function hlsResponseDebug(response, fallbackUrl = "") {
+      const result = {
+        responseUrl: String(response?.url || fallbackUrl || "").slice(0, 500),
+      };
+      const value = response?.data;
+      let bytes = null;
+      if (typeof value === "string") {
+        result.responsePreview = value.slice(0, 1024);
+        bytes = new TextEncoder().encode(value);
+      } else if (value instanceof ArrayBuffer) {
+        bytes = new Uint8Array(value);
+      } else if (ArrayBuffer.isView(value)) {
+        bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+      } else if (value !== undefined && value !== null) {
+        try { result.responsePreview = JSON.stringify(value).slice(0, 1024); }
+        catch { result.responsePreview = String(value).slice(0, 1024); }
+      }
+      if (bytes) {
+        result.responseBytes = bytes.byteLength;
+        result.responsePrefixHex = Array.from(bytes.slice(0, 48), (byte) => byte.toString(16).padStart(2, "0")).join("");
+        if (!result.responsePreview) {
+          result.responsePreview = new TextDecoder("utf-8", { fatal: false }).decode(bytes.slice(0, 1024));
+        }
+      }
+      return result;
     }
 
     function attachHls(url) {
@@ -513,6 +547,11 @@
               error: data.error?.message || "",
               sn: data.frag?.sn,
               fragmentType: data.frag?.type,
+              contextType: data.context?.type || "",
+              ...hlsResponseDebug(
+                data.response,
+                data.context?.url || data.frag?.url || "",
+              ),
             });
             if (!data.fatal) nonFatalLogs += 1;
           }
@@ -557,6 +596,33 @@
       });
     }
 
+    async function attachDash(url) {
+      if (!window.dashjs?.MediaPlayer) throw new Error("dash.js 加载失败，无法播放 MPEG-DASH");
+      const dash = state.dash = window.dashjs.MediaPlayer().create();
+      const events = window.dashjs.MediaPlayer.events;
+      dash.on(events.STREAM_INITIALIZED, () => {
+        reportPlayerLog("dash-stream-initialized");
+      });
+      dash.on(events.ERROR, (event) => {
+        const error = event?.error || event;
+        reportPlayerLog("dash-error", {
+          code: error?.code || event?.code || "",
+          message: error?.message || event?.message || String(error || "DASH error"),
+        });
+      });
+      reportPlayerLog("dash-attach-start", {
+        dashVersion: window.dashjs.Version || window.dashjs.MediaPlayer.version || "5.2.0",
+      });
+      try {
+        dash.initialize(player, url, false);
+        await waitForMediaReady(30000);
+      } catch (error) {
+        try { dash.reset(); } catch { /* 忽略未完成初始化时的清理异常。 */ }
+        if (state.dash === dash) state.dash = null;
+        throw error;
+      }
+    }
+
     async function attachPlayback(result) {
       const url = typeof result === "string" ? result : result?.url;
       if (typeof url !== "string" || !url) throw new Error("没有取得播放地址");
@@ -564,10 +630,12 @@
       reportPlayerLog("attach-playback", {
         mode,
         isHls: result?.is_hls,
+        isDash: result?.is_dash,
         proxied: result?.proxied,
         nativeHls: player.canPlayType("application/vnd.apple.mpegurl") || "none",
         hlsJsAvailable: Boolean(window.Hls),
         hlsJsSupported: Boolean(window.Hls?.isSupported?.()),
+        dashJsAvailable: Boolean(window.dashjs?.MediaPlayer),
       });
 
       if (mode === "embed") {
@@ -592,13 +660,17 @@
       player.hidden = false;
       setPlayerLoading(true);
       const isHls = result?.is_hls === true || /\.m3u8(?:$|[?&#])/i.test(url);
+      const isDash = result?.is_dash === true || /\.mpd(?:$|[?&#])/i.test(url);
       const nativeHls = player.canPlayType("application/vnd.apple.mpegurl");
       const hlsJsSupported = Boolean(window.Hls?.isSupported?.());
       const safariNativeHls = Boolean(nativeHls)
         && /Safari/i.test(navigator.userAgent)
         && !/(?:Chrome|Chromium|CriOS|Edg|OPR|Android)/i.test(navigator.userAgent);
       playerStatus.textContent = "正在加载媒体……";
-      if (isHls && hlsJsSupported && !safariNativeHls) {
+      if (isDash) {
+        reportPlayerLog("playback-engine", { engine: "dash.js" });
+        await attachDash(url);
+      } else if (isHls && hlsJsSupported && !safariNativeHls) {
         reportPlayerLog("playback-engine", { engine: "hls.js" });
         await attachHls(url);
       } else if (isHls && nativeHls) {
@@ -645,6 +717,7 @@
         site: state.site,
         vodId: state.vodId.slice(0, 300),
         hlsJsAvailable: Boolean(window.Hls),
+        dashJsAvailable: Boolean(window.dashjs?.MediaPlayer),
       });
       if (!state.site || !state.vodId) {
         loading.hidden = true;

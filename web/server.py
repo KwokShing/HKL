@@ -15,13 +15,14 @@ import sys
 import threading
 import time
 import traceback
+import xml.etree.ElementTree as ET
 from functools import partial
 from html import unescape
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from itertools import zip_longest
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit, urlunsplit
 
 import requests
 import urllib3
@@ -533,11 +534,15 @@ def is_hls_url(url: str) -> bool:
     return any(re.search(r"\.m3u8(?:$|[?&#])", candidate, re.I) for candidate in media_url_candidates(url))
 
 
+def is_dash_url(url: str) -> bool:
+    return any(re.search(r"\.mpd(?:$|[?&#])", candidate, re.I) for candidate in media_url_candidates(url))
+
+
 def is_direct_media_url(url: str) -> bool:
-    if is_hls_url(url):
+    if is_hls_url(url) or is_dash_url(url):
         return True
     return any(
-        re.search(r"\.(?:mp4|m4v|webm|flv|mkv|mpd|ts)(?:$|[?&#])", candidate, re.I)
+        re.search(r"\.(?:mp4|m4v|webm|flv|mkv|ts)(?:$|[?&#])", candidate, re.I)
         for candidate in media_url_candidates(url)
     )
 
@@ -581,6 +586,7 @@ def normalize_player(result: Any) -> dict[str, Any]:
             "source_url": url,
             "mode": "embed",
             "is_hls": False,
+            "is_dash": False,
             "options": options,
             "headers": {},
         }
@@ -590,6 +596,7 @@ def normalize_player(result: Any) -> dict[str, Any]:
         "url": url,
         "mode": "media",
         "is_hls": is_hls_url(url),
+        "is_dash": is_dash_url(url),
         "options": options,
         "headers": headers,
     }
@@ -598,7 +605,7 @@ def normalize_player(result: Any) -> dict[str, Any]:
 def register_media_target(url: str, headers: dict[str, Any], kind: str = "media") -> str:
     if not url.startswith(("http://", "https://")):
         return url
-    if kind not in {"manifest", "segment", "map", "key", "media"}:
+    if kind not in {"manifest", "dash_manifest", "dash_media", "segment", "map", "key", "media"}:
         kind = "media"
     blocked_headers = {"connection", "content-length", "host", "proxy-authorization", "transfer-encoding"}
     safe_headers = {
@@ -612,13 +619,87 @@ def register_media_target(url: str, headers: dict[str, Any], kind: str = "media"
             for old_token in list(_MEDIA_TARGETS)[:1024]:
                 _MEDIA_TARGETS.pop(old_token, None)
         _MEDIA_TARGETS[token] = (url, safe_headers, kind)
-    suffix = "&format=.m3u8" if kind == "manifest" else ""
+    if kind == "dash_media":
+        return f"/api/dash-media/{quote(token, safe='')}/"
+    suffix = "&format=.m3u8" if kind == "manifest" else "&format=.mpd" if kind == "dash_manifest" else ""
     return f"/api/media-proxy?token={quote(token, safe='')}{suffix}"
 
 
 def get_media_target(token: str) -> tuple[str, dict[str, str], str] | None:
     with _MEDIA_TARGETS_LOCK:
         return _MEDIA_TARGETS.get(token)
+
+
+def _dash_directory_url(url: str) -> str:
+    parsed = urlsplit(url)
+    directory = parsed.path.rsplit("/", 1)[0] + "/"
+    return urlunsplit((parsed.scheme, parsed.netloc, directory, parsed.query, ""))
+
+
+def _proxy_absolute_dash_value(value: str, headers: dict[str, str]) -> str:
+    if not value.startswith(("http://", "https://")):
+        return value
+    parsed = urlsplit(value)
+    directory = parsed.path.rsplit("/", 1)[0] + "/"
+    file_name = parsed.path.rsplit("/", 1)[-1]
+    base_url = urlunsplit((parsed.scheme, parsed.netloc, directory, "", ""))
+    proxy_base = register_media_target(base_url, headers, kind="dash_media")
+    return proxy_base + file_name + (f"?{parsed.query}" if parsed.query else "")
+
+
+def rewrite_dash_manifest(data: bytes, base_url: str, headers: dict[str, str]) -> bytes | None:
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return None
+
+    def local_name(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    if local_name(root.tag) != "MPD":
+        return None
+    namespace_match = re.match(r"\{([^}]+)\}", root.tag)
+    namespace = namespace_match.group(1) if namespace_match else ""
+    if namespace:
+        ET.register_namespace("", namespace)
+    upstream_root = _dash_directory_url(base_url)
+    url_attributes = {"media", "initialization", "sourceURL", "index"}
+
+    def walk(element: ET.Element, inherited_base: str) -> None:
+        base_nodes = [child for child in element if local_name(child.tag) == "BaseURL"]
+        child_base = inherited_base
+        for index, node in enumerate(base_nodes):
+            original = (node.text or "").strip()
+            if not original:
+                continue
+            resolved = urljoin(inherited_base, original)
+            node.text = register_media_target(resolved, headers, kind="dash_media")
+            if index == 0:
+                child_base = resolved
+        for name, value in list(element.attrib.items()):
+            if local_name(name) in url_attributes:
+                element.set(name, _proxy_absolute_dash_value(value, headers))
+        for child in element:
+            if local_name(child.tag) != "BaseURL":
+                walk(child, child_base)
+
+    root_bases = [child for child in root if local_name(child.tag) == "BaseURL"]
+    if root_bases:
+        walk(root, base_url)
+    else:
+        base_tag = f"{{{namespace}}}BaseURL" if namespace else "BaseURL"
+        base_element = ET.Element(base_tag)
+        base_element.text = register_media_target(upstream_root, headers, kind="dash_media")
+        insert_at = next(
+            (index for index, child in enumerate(root) if local_name(child.tag) == "Period"),
+            len(root),
+        )
+        root.insert(insert_at, base_element)
+        for child in root:
+            if child is not base_element:
+                walk(child, upstream_root)
+
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
 def rewrite_media_manifest(text: str, base_url: str, headers: dict[str, str]) -> str:
@@ -666,6 +747,19 @@ def rewrite_media_manifest(text: str, base_url: str, headers: dict[str, str]) ->
     return "\n".join(output) + "\n"
 
 
+def decode_media_manifest(data: bytes) -> str | None:
+    """解码并规范化 HLS 文本，确保 #EXTM3U 是响应的第一个字符。"""
+    try:
+        if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+            text = data.decode("utf-16")
+        else:
+            text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return None
+    text = text.lstrip("\ufeff\x00 \t\r\n")
+    return text if text.startswith("#EXTM3U") else None
+
+
 def unwrap_png_transport_stream(data: bytes) -> bytes | None:
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
         return None
@@ -695,6 +789,9 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
         params = parse_qs(parsed.query, keep_blank_values=True)
+        if parsed.path.startswith("/api/dash-media/"):
+            self.api_dash_media(parsed)
+            return
         routes = {
             "/api/plugins": self.api_plugins,
             "/api/home": self.api_home,
@@ -886,6 +983,11 @@ class Handler(SimpleHTTPRequestHandler):
                         player["url"], player["headers"], kind="manifest"
                     )
                     player["proxied"] = True
+                elif player["is_dash"]:
+                    player["url"] = register_media_target(
+                        player["url"], player["headers"], kind="dash_manifest"
+                    )
+                    player["proxied"] = True
                 elif player["headers"]:
                     player["url"] = register_media_target(
                         player["url"], player["headers"], kind="media"
@@ -898,6 +1000,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "jx": bool(result.get("jx")) if isinstance(result, dict) else False,
                 "mode": player.get("mode"),
                 "is_hls": player.get("is_hls"),
+                "is_dash": player.get("is_dash"),
                 "proxied": player.get("proxied", False),
                 "source_url": str(player.get("source_url") or result.get("url") or "")[:500]
                     if isinstance(result, dict) else "",
@@ -913,6 +1016,73 @@ class Handler(SimpleHTTPRequestHandler):
             }, ensure_ascii=False), flush=True)
             self.send_json(422, {"error": str(exc)})
 
+    def api_dash_media(self, parsed: Any) -> None:
+        remainder = parsed.path[len("/api/dash-media/"):]
+        token, separator, encoded_path = remainder.partition("/")
+        target = get_media_target(token)
+        if not token or not separator or target is None or target[2] != "dash_media":
+            self.send_json(404, {"error": "DASH 媒体代理地址已失效，请重新选择剧集"})
+            return
+        base_url, headers, _kind = target
+        relative_path = unquote(encoded_path)
+        if "\x00" in relative_path or relative_path.startswith(("/", "\\")):
+            self.send_json(400, {"error": "DASH 媒体路径无效"})
+            return
+        upstream_url = base_url if not relative_path else urljoin(
+            base_url if base_url.endswith("/") else base_url + "/",
+            relative_path,
+        )
+        base_parts, upstream_parts = urlsplit(base_url), urlsplit(upstream_url)
+        if (upstream_parts.scheme, upstream_parts.netloc) != (base_parts.scheme, base_parts.netloc):
+            self.send_json(400, {"error": "DASH 媒体路径越界"})
+            return
+        query = parsed.query or upstream_parts.query or base_parts.query
+        upstream_url = urlunsplit(upstream_parts._replace(query=query, fragment=""))
+        request_headers = dict(headers)
+        range_header = self.headers.get("Range")
+        if range_header:
+            request_headers["Range"] = range_header
+        try:
+            response = requests.get(
+                upstream_url,
+                headers=request_headers,
+                timeout=30,
+                verify=False,
+                allow_redirects=True,
+            )
+        except requests.RequestException as exc:
+            self.send_json(502, {"error": f"DASH 媒体请求失败：{exc}"})
+            return
+
+        body = response.content
+        content_type = response.headers.get("Content-Type") or "application/octet-stream"
+        if relative_path.lower().endswith(".webp") and len(body) >= 8:
+            box_type = body[4:8]
+            if box_type in {b"ftyp", b"styp", b"moof"} or b"moof" in body[:256]:
+                content_type = "application/mp4"
+        if response.status_code >= 400 or "init-stream" in relative_path:
+            print("[dash-media] " + json.dumps({
+                "token": token[:10],
+                "path": relative_path[:300],
+                "status": response.status_code,
+                "range": bool(range_header),
+                "content_type": content_type,
+                "bytes": len(body),
+                "prefix_hex": body[:32].hex(),
+            }, ensure_ascii=False), flush=True)
+
+        self.send_response(response.status_code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        for name in ("Accept-Ranges", "Content-Range"):
+            value = response.headers.get(name)
+            if value:
+                self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def api_media_proxy(self, params: dict[str, list[str]]) -> None:
         token = self.first(params, "token")
         target = get_media_target(token)
@@ -924,7 +1094,11 @@ class Handler(SimpleHTTPRequestHandler):
         range_header = self.headers.get("Range")
         image_path = urlsplit(url).path.lower()
         image_wrapped_candidate = bool(re.search(r"\.(?:png|jpe?g|webp|gif)$", image_path))
-        if range_header and not image_wrapped_candidate:
+        if kind in {"manifest", "dash_manifest"}:
+            for name in list(request_headers):
+                if name.lower() == "range":
+                    request_headers.pop(name, None)
+        elif range_header and not image_wrapped_candidate:
             request_headers["Range"] = range_header
         try:
             response = requests.get(
@@ -944,6 +1118,7 @@ class Handler(SimpleHTTPRequestHandler):
         upstream_bytes = len(body)
         content_type = response.headers.get("Content-Type") or "application/octet-stream"
         transformed_kind = ""
+        invalid_preview = ""
 
         final_image_path = urlsplit(response.url).path.lower()
         should_probe_full = status == 206 and bool(range_header) and (
@@ -974,24 +1149,51 @@ class Handler(SimpleHTTPRequestHandler):
                 pass
 
         if not transformed_kind:
-            if body.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"#EXTM3U"):
-                manifest = rewrite_media_manifest(
-                    body.decode("utf-8-sig", errors="replace"), response.url, headers
-                )
-                body = manifest.encode("utf-8")
-                status = 200
-                content_type = "application/vnd.apple.mpegurl; charset=utf-8"
-                transformed_kind = "manifest"
-            else:
-                transport_stream = unwrap_png_transport_stream(body)
-                if transport_stream is not None:
-                    body = transport_stream
+            if kind == "dash_manifest":
+                dash_manifest = rewrite_dash_manifest(body, response.url, headers)
+                if dash_manifest is not None:
+                    body = dash_manifest
                     status = 200
-                    content_type = "video/mp2t"
-                    transformed_kind = "png-ts"
+                    content_type = "application/dash+xml; charset=utf-8"
+                    transformed_kind = "dash-manifest"
+                elif 200 <= status < 300:
+                    invalid_preview = body[:160].decode("utf-8", errors="replace")
+                    invalid_preview = re.sub(r"\s+", " ", invalid_preview).strip()[:160]
+                    body = "上游返回了 HTTP 200，但内容不是有效的 DASH MPD".encode("utf-8")
+                    status = 502
+                    content_type = "text/plain; charset=utf-8"
+                    transformed_kind = "invalid-dash-manifest"
+            else:
+                manifest_text = decode_media_manifest(body)
+                if manifest_text is not None:
+                    manifest = rewrite_media_manifest(manifest_text, response.url, headers)
+                    body = manifest.encode("utf-8")
+                    status = 200
+                    content_type = "application/vnd.apple.mpegurl; charset=utf-8"
+                    transformed_kind = "manifest"
+                elif kind == "manifest" and 200 <= status < 300:
+                    invalid_preview = body[:160].decode("utf-8", errors="replace")
+                    invalid_preview = re.sub(r"\s+", " ", invalid_preview).strip()[:160]
+                    body = "上游返回了 HTTP 200，但内容不是有效的 HLS 播放清单".encode("utf-8")
+                    status = 502
+                    content_type = "text/plain; charset=utf-8"
+                    transformed_kind = "invalid-manifest"
+                else:
+                    transport_stream = unwrap_png_transport_stream(body)
+                    if transport_stream is not None:
+                        body = transport_stream
+                        status = 200
+                        content_type = "video/mp2t"
+                        transformed_kind = "png-ts"
 
-        if transformed_kind or upstream_status >= 400 or kind == "manifest":
-            print("[media-proxy] " + json.dumps({
+        content_type_lower = content_type.lower()
+        looks_textual = (
+            content_type_lower.startswith("text/")
+            or any(value in content_type_lower for value in ("json", "xml", "javascript", "mpegurl"))
+        )
+        if transformed_kind or upstream_status >= 400 or kind in {"manifest", "dash_manifest"} or looks_textual:
+            log_data = {
+                "token": token[:10],
                 "kind": kind,
                 "upstream_status": upstream_status,
                 "output_status": status,
@@ -999,8 +1201,18 @@ class Handler(SimpleHTTPRequestHandler):
                 "content_type": content_type[:100],
                 "upstream_bytes": upstream_bytes,
                 "output_bytes": len(body),
+                "prefix_hex": body[:48].hex(),
                 "transformed": transformed_kind or "none",
-            }, ensure_ascii=False), flush=True)
+            }
+            if kind in {"manifest", "dash_manifest"} or transformed_kind in {
+                "manifest", "invalid-manifest", "dash-manifest", "invalid-dash-manifest"
+            } or looks_textual:
+                body_preview = body[:1024].decode("utf-8", errors="replace")
+                body_preview = re.sub(r"token=[A-Za-z0-9_-]+", "token=<redacted>", body_preview)
+                log_data["body_prefix"] = body_preview
+            if invalid_preview:
+                log_data["upstream_preview"] = invalid_preview
+            print("[media-proxy] " + json.dumps(log_data, ensure_ascii=False), flush=True)
 
         self.send_response(status)
         self.send_header("Content-Type", content_type)
