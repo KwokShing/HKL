@@ -13,6 +13,7 @@ import re
 import secrets
 import sys
 import threading
+import time
 import traceback
 from functools import partial
 from html import unescape
@@ -34,8 +35,16 @@ PORT = 8000
 CALL_TIMEOUT = 45
 MEDIA_PROXY_LIMIT = 8192
 
-_MEDIA_TARGETS: dict[str, tuple[str, dict[str, str]]] = {}
+_MEDIA_TARGETS: dict[str, tuple[str, dict[str, str], str]] = {}
 _MEDIA_TARGETS_LOCK = threading.Lock()
+_PLUGIN_DISCOVERY_LOCK = threading.Lock()
+_PLUGIN_DISCOVERY_SIGNATURE: tuple[tuple[str, int, int], ...] = ()
+_PLUGIN_DISCOVERY_RESULT: list[dict[str, Any]] | None = None
+_RESULT_CACHE_LOCK = threading.Lock()
+_RESULT_CACHE: dict[tuple[str, int, str, str], tuple[float, Any]] = {}
+_RESULT_CACHE_LIMIT = 1024
+HOME_CACHE_TTL = 600
+CATEGORY_CACHE_TTL = 180
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 sys.path.insert(0, str(REPO_ROOT))
@@ -55,7 +64,7 @@ def _safe_plugin_path(file_name: str) -> Path:
         raise PluginError("插件不存在或路径无效")
     return candidate
 
-def discover_plugins() -> list[dict[str, Any]]:
+def _scan_plugins() -> list[dict[str, Any]]:
     import warnings
 
     plugins = []
@@ -91,6 +100,7 @@ def discover_plugins() -> list[dict[str, Any]]:
             {
                 "id": path.name,
                 "name": path.stem,
+                "modified": str(path.stat().st_mtime_ns),
                 "methods": sorted(
                     methods & {"homeContent", "categoryContent", "searchContent", "detailContent", "playerContent"}
                 ),
@@ -99,6 +109,63 @@ def discover_plugins() -> list[dict[str, Any]]:
             }
         )
     return plugins
+
+
+def _plugin_directory_signature() -> tuple[tuple[str, int, int], ...]:
+    entries = []
+    for path in sorted(PY_DIR.glob("*.py"), key=lambda item: item.name.casefold()):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        entries.append((path.name, stat.st_mtime_ns, stat.st_size))
+    return tuple(entries)
+
+
+def discover_plugins() -> list[dict[str, Any]]:
+    global _PLUGIN_DISCOVERY_RESULT, _PLUGIN_DISCOVERY_SIGNATURE
+
+    signature = _plugin_directory_signature()
+    cache_path = CACHE_DIR / "plugin-discovery.json"
+    with _PLUGIN_DISCOVERY_LOCK:
+        if _PLUGIN_DISCOVERY_RESULT is not None and signature == _PLUGIN_DISCOVERY_SIGNATURE:
+            return _PLUGIN_DISCOVERY_RESULT
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            cached_signature = tuple(
+                (str(item[0]), int(item[1]), int(item[2]))
+                for item in payload.get("signature", [])
+            )
+            cached_plugins = payload.get("plugins")
+            if (
+                cached_signature == signature
+                and isinstance(cached_plugins, list)
+                and all(
+                    isinstance(plugin, dict) and isinstance(plugin.get("modified"), str)
+                    for plugin in cached_plugins
+                )
+            ):
+                _PLUGIN_DISCOVERY_SIGNATURE = signature
+                _PLUGIN_DISCOVERY_RESULT = cached_plugins
+                print(f"[plugins] disk cache hit {len(cached_plugins)}", flush=True)
+                return cached_plugins
+        except (OSError, TypeError, ValueError):
+            pass
+
+        started = time.perf_counter()
+        plugins = _scan_plugins()
+        _PLUGIN_DISCOVERY_SIGNATURE = _plugin_directory_signature()
+        _PLUGIN_DISCOVERY_RESULT = plugins
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps({
+                "signature": _PLUGIN_DISCOVERY_SIGNATURE,
+                "plugins": plugins,
+            }, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+        print(f"[plugins] 扫描 {len(plugins)} 个插件，用时 {(time.perf_counter() - started) * 1000:.0f}ms", flush=True)
+        return plugins
 
 
 def _invoke(instance: Any, method_name: str, candidates: list[tuple[Any, ...]]) -> Any:
@@ -319,11 +386,40 @@ def get_runtime(site_id: str) -> PluginRuntime:
         return runtime
 
 
+def get_cached_plugin_result(site: str, operation: str, data: dict[str, Any], ttl: int) -> Any:
+    path = _safe_plugin_path(site)
+    signature = path.stat().st_mtime_ns
+    data_key = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    key = (site, signature, operation, data_key)
+    now = time.monotonic()
+    with _RESULT_CACHE_LOCK:
+        cached = _RESULT_CACHE.get(key)
+        if cached is not None and cached[0] > now:
+            print(f"[cache] hit {operation} {site}", flush=True)
+            return cached[1]
+        if cached is not None:
+            _RESULT_CACHE.pop(key, None)
+
+    started = time.perf_counter()
+    result = get_runtime(site).call(operation, data)
+    with _RESULT_CACHE_LOCK:
+        expired = [cache_key for cache_key, (expires, _) in _RESULT_CACHE.items() if expires <= now]
+        for cache_key in expired:
+            _RESULT_CACHE.pop(cache_key, None)
+        while len(_RESULT_CACHE) >= _RESULT_CACHE_LIMIT:
+            _RESULT_CACHE.pop(next(iter(_RESULT_CACHE)))
+        _RESULT_CACHE[key] = (time.monotonic() + ttl, result)
+    print(f"[cache] store {operation} {site} {(time.perf_counter() - started) * 1000:.0f}ms", flush=True)
+    return result
+
+
 def close_runtimes() -> None:
     with _RUNTIMES_LOCK:
         for runtime in _RUNTIMES.values():
             runtime.close()
         _RUNTIMES.clear()
+    with _RESULT_CACHE_LOCK:
+        _RESULT_CACHE.clear()
 
 
 atexit.register(close_runtimes)
@@ -422,6 +518,46 @@ def normalize_detail(result: Any) -> dict[str, Any]:
     }
 
 
+def media_url_candidates(url: str) -> list[str]:
+    candidates = [url]
+    for candidate in list(candidates):
+        try:
+            for values in parse_qs(urlsplit(candidate).query).values():
+                candidates.extend(value for value in values if value not in candidates)
+        except ValueError:
+            continue
+    return candidates
+
+
+def is_hls_url(url: str) -> bool:
+    return any(re.search(r"\.m3u8(?:$|[?&#])", candidate, re.I) for candidate in media_url_candidates(url))
+
+
+def is_direct_media_url(url: str) -> bool:
+    if is_hls_url(url):
+        return True
+    return any(
+        re.search(r"\.(?:mp4|m4v|webm|flv|mkv|mpd|ts)(?:$|[?&#])", candidate, re.I)
+        for candidate in media_url_candidates(url)
+    )
+
+
+def youku_embed_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return ""
+    if not (parsed.hostname or "").lower().endswith("youku.com"):
+        return ""
+    video_id = next(iter(parse_qs(parsed.query).get("vid", [])), "")
+    if not video_id:
+        match = re.search(r"/(?:id_|embed/)([A-Za-z0-9_=-]+)", parsed.path, re.I)
+        video_id = match.group(1) if match else ""
+    if not re.fullmatch(r"[A-Za-z0-9_=-]+", video_id):
+        return ""
+    return f"https://player.youku.com/embed/{quote(video_id, safe='=_-')}"
+
+
 def normalize_player(result: Any) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise PluginError("playerContent 没有返回字典")
@@ -437,12 +573,33 @@ def normalize_player(result: Any) -> dict[str, Any]:
             raise PluginError("该片源需要 TVBox 外部解析，浏览器无法直接播放")
         raise PluginError("插件没有返回可直接播放的 HTTP 地址")
     headers = result.get("header") if isinstance(result.get("header"), dict) else {}
-    return {"url": url, "options": options, "headers": headers}
+    requires_parse = bool(result.get("parse") or result.get("jx"))
+    embed_url = youku_embed_url(url) if requires_parse else ""
+    if embed_url:
+        return {
+            "url": embed_url,
+            "source_url": url,
+            "mode": "embed",
+            "is_hls": False,
+            "options": options,
+            "headers": {},
+        }
+    if requires_parse and not is_direct_media_url(url):
+        raise PluginError("该片源返回的是平台网页，需要 TVBox 外部解析；请选择其他片源")
+    return {
+        "url": url,
+        "mode": "media",
+        "is_hls": is_hls_url(url),
+        "options": options,
+        "headers": headers,
+    }
 
 
-def register_media_target(url: str, headers: dict[str, Any], manifest: bool = False) -> str:
+def register_media_target(url: str, headers: dict[str, Any], kind: str = "media") -> str:
     if not url.startswith(("http://", "https://")):
         return url
+    if kind not in {"manifest", "segment", "map", "key", "media"}:
+        kind = "media"
     blocked_headers = {"connection", "content-length", "host", "proxy-authorization", "transfer-encoding"}
     safe_headers = {
         str(name): str(value)
@@ -454,29 +611,57 @@ def register_media_target(url: str, headers: dict[str, Any], manifest: bool = Fa
         if len(_MEDIA_TARGETS) >= MEDIA_PROXY_LIMIT:
             for old_token in list(_MEDIA_TARGETS)[:1024]:
                 _MEDIA_TARGETS.pop(old_token, None)
-        _MEDIA_TARGETS[token] = (url, safe_headers)
-    suffix = "&format=.m3u8" if manifest else ""
+        _MEDIA_TARGETS[token] = (url, safe_headers, kind)
+    suffix = "&format=.m3u8" if kind == "manifest" else ""
     return f"/api/media-proxy?token={quote(token, safe='')}{suffix}"
 
 
-def get_media_target(token: str) -> tuple[str, dict[str, str]] | None:
+def get_media_target(token: str) -> tuple[str, dict[str, str], str] | None:
     with _MEDIA_TARGETS_LOCK:
         return _MEDIA_TARGETS.get(token)
 
 
 def rewrite_media_manifest(text: str, base_url: str, headers: dict[str, str]) -> str:
-    def proxy_url(value: str) -> str:
+    def proxy_url(value: str, kind: str) -> str:
         target = urljoin(base_url, value)
-        return register_media_target(target, headers) if target.startswith(("http://", "https://")) else value
+        return (
+            register_media_target(target, headers, kind=kind)
+            if target.startswith(("http://", "https://"))
+            else value
+        )
 
     output = []
+    next_uri_kind = "segment"
     for line in text.splitlines():
         stripped = line.strip()
         if stripped and not stripped.startswith("#"):
-            output.append(proxy_url(stripped))
+            output.append(proxy_url(stripped, next_uri_kind))
+            next_uri_kind = "segment"
             continue
+
+        upper = stripped.upper()
+        if upper.startswith("#EXT-X-STREAM-INF"):
+            next_uri_kind = "manifest"
         if 'URI="' in line:
-            line = re.sub(r'URI="([^"]+)"', lambda match: f'URI="{proxy_url(match.group(1))}"', line)
+            if upper.startswith(("#EXT-X-KEY", "#EXT-X-SESSION-KEY")):
+                uri_kind = "key"
+            elif upper.startswith("#EXT-X-MAP"):
+                uri_kind = "map"
+            elif upper.startswith((
+                "#EXT-X-MEDIA",
+                "#EXT-X-I-FRAME-STREAM-INF",
+                "#EXT-X-RENDITION-REPORT",
+            )):
+                uri_kind = "manifest"
+            elif upper.startswith("#EXT-X-PRELOAD-HINT") and "TYPE=MAP" in upper:
+                uri_kind = "map"
+            else:
+                uri_kind = "segment"
+            line = re.sub(
+                r'URI="([^"]+)"',
+                lambda match: f'URI="{proxy_url(match.group(1), uri_kind)}"',
+                line,
+            )
         output.append(line)
     return "\n".join(output) + "\n"
 
@@ -529,10 +714,45 @@ class Handler(SimpleHTTPRequestHandler):
             return
         super().do_GET()
 
+    def do_POST(self) -> None:
+        if urlsplit(self.path).path == "/api/client-log":
+            self.api_client_log()
+            return
+        self.send_json(404, {"error": "未知 API"})
+
     def end_headers(self) -> None:
+        path = urlsplit(self.path).path
+        if path in {"/", "/index.html", "/detail.html"}:
+            self.send_header("Cache-Control", "no-store, max-age=0")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         super().end_headers()
+
+    def api_client_log(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            length = 0
+        if length < 1 or length > 8192:
+            self.send_json(413, {"error": "客户端日志大小无效"})
+            return
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8", errors="replace"))
+        except (TypeError, ValueError):
+            self.send_json(400, {"error": "客户端日志不是有效 JSON"})
+            return
+        if not isinstance(payload, dict):
+            self.send_json(400, {"error": "客户端日志格式错误"})
+            return
+        debug_id = re.sub(r"[^A-Za-z0-9_-]", "", str(payload.get("debugId") or ""))[:24] or "unknown"
+        event = re.sub(r"[^A-Za-z0-9_.:-]", "", str(payload.get("event") or "event"))[:80]
+        data = json.dumps(payload.get("data"), ensure_ascii=False, default=str)[:4000]
+        data = data.replace("\r", "\\r").replace("\n", "\\n")
+        print(f"[client:{debug_id}] {event} {data}", flush=True)
+        self.send_response(204)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def first(self, params: dict[str, list[str]], name: str) -> str:
         values = params.get(name, [])
@@ -560,8 +780,16 @@ class Handler(SimpleHTTPRequestHandler):
             return None
         return page
 
-    def call_plugin(self, site: str, operation: str, data: dict[str, Any]) -> Any:
+    def call_plugin(
+        self,
+        site: str,
+        operation: str,
+        data: dict[str, Any],
+        cache_ttl: int = 0,
+    ) -> Any:
         try:
+            if cache_ttl > 0:
+                return get_cached_plugin_result(site, operation, data, cache_ttl)
             return get_runtime(site).call(operation, data)
         except PluginTimeout as exc:
             self.send_json(504, {"error": str(exc)})
@@ -578,7 +806,7 @@ class Handler(SimpleHTTPRequestHandler):
         site = self.require_site(params)
         if site is None:
             return
-        result = self.call_plugin(site, "home", {})
+        result = self.call_plugin(site, "home", {}, cache_ttl=HOME_CACHE_TTL)
         if result is None:
             return
         try:
@@ -594,7 +822,12 @@ class Handler(SimpleHTTPRequestHandler):
         if not tid:
             self.send_json(400, {"error": "缺少 type_id"})
             return
-        result = self.call_plugin(site, "category", {"tid": tid, "page": page, "extend": {}})
+        result = self.call_plugin(
+            site,
+            "category",
+            {"tid": tid, "page": page, "extend": {}},
+            cache_ttl=CATEGORY_CACHE_TTL,
+        )
         if result is None:
             return
         try:
@@ -647,11 +880,37 @@ class Handler(SimpleHTTPRequestHandler):
             return
         try:
             player = normalize_player(result)
-            if re.search(r"\.m3u8(?:$|[?#])", player["url"], re.I):
-                player["url"] = register_media_target(player["url"], player["headers"], manifest=True)
-                player["proxied"] = True
+            if player["mode"] == "media":
+                if player["is_hls"]:
+                    player["url"] = register_media_target(
+                        player["url"], player["headers"], kind="manifest"
+                    )
+                    player["proxied"] = True
+                elif player["headers"]:
+                    player["url"] = register_media_target(
+                        player["url"], player["headers"], kind="media"
+                    )
+                    player["proxied"] = True
+            print("[player] " + json.dumps({
+                "site": site,
+                "flag": self.first(params, "flag"),
+                "parse": bool(result.get("parse")) if isinstance(result, dict) else False,
+                "jx": bool(result.get("jx")) if isinstance(result, dict) else False,
+                "mode": player.get("mode"),
+                "is_hls": player.get("is_hls"),
+                "proxied": player.get("proxied", False),
+                "source_url": str(player.get("source_url") or result.get("url") or "")[:500]
+                    if isinstance(result, dict) else "",
+                "output_url": str(player.get("url") or "")[:500],
+            }, ensure_ascii=False), flush=True)
             self.send_json(200, player)
         except PluginError as exc:
+            print("[player-error] " + json.dumps({
+                "site": site,
+                "flag": self.first(params, "flag"),
+                "error": str(exc),
+                "result": str(result)[:1000],
+            }, ensure_ascii=False), flush=True)
             self.send_json(422, {"error": str(exc)})
 
     def api_media_proxy(self, params: dict[str, list[str]]) -> None:
@@ -660,7 +919,7 @@ class Handler(SimpleHTTPRequestHandler):
         if target is None:
             self.send_json(404, {"error": "媒体代理地址已失效，请重新选择剧集"})
             return
-        url, headers = target
+        url, headers, kind = target
         request_headers = dict(headers)
         range_header = self.headers.get("Range")
         image_path = urlsplit(url).path.lower()
@@ -681,13 +940,18 @@ class Handler(SimpleHTTPRequestHandler):
 
         body = response.content
         status = response.status_code
+        upstream_status = status
+        upstream_bytes = len(body)
         content_type = response.headers.get("Content-Type") or "application/octet-stream"
+        transformed_kind = ""
+
         final_image_path = urlsplit(response.url).path.lower()
-        partial_image_candidate = status == 206 and range_header and (
-            content_type.lower().startswith("image/")
+        should_probe_full = status == 206 and bool(range_header) and (
+            kind in {"segment", "map"}
+            or content_type.lower().startswith("image/")
             or bool(re.search(r"\.(?:png|jpe?g|webp|gif)$", final_image_path))
         )
-        if partial_image_candidate:
+        if should_probe_full:
             try:
                 full_response = requests.get(
                     url,
@@ -696,32 +960,53 @@ class Handler(SimpleHTTPRequestHandler):
                     verify=False,
                     allow_redirects=True,
                 )
-                if full_response.ok:
+                full_body = full_response.content
+                transport_stream = (
+                    unwrap_png_transport_stream(full_body) if full_response.ok else None
+                )
+                if transport_stream is not None:
                     response = full_response
-                    body = response.content
-                    status = response.status_code
-                    content_type = response.headers.get("Content-Type") or "application/octet-stream"
+                    body = transport_stream
+                    status = 200
+                    content_type = "video/mp2t"
+                    transformed_kind = "png-ts"
             except requests.RequestException:
                 pass
-        transformed = False
-        if body.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"#EXTM3U"):
-            manifest = rewrite_media_manifest(body.decode("utf-8-sig", errors="replace"), response.url, headers)
-            body = manifest.encode("utf-8")
-            content_type = "application/vnd.apple.mpegurl; charset=utf-8"
-            transformed = True
-        else:
-            transport_stream = unwrap_png_transport_stream(body)
-            if transport_stream is not None:
-                body = transport_stream
+
+        if not transformed_kind:
+            if body.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"#EXTM3U"):
+                manifest = rewrite_media_manifest(
+                    body.decode("utf-8-sig", errors="replace"), response.url, headers
+                )
+                body = manifest.encode("utf-8")
                 status = 200
-                content_type = "video/mp2t"
-                transformed = True
+                content_type = "application/vnd.apple.mpegurl; charset=utf-8"
+                transformed_kind = "manifest"
+            else:
+                transport_stream = unwrap_png_transport_stream(body)
+                if transport_stream is not None:
+                    body = transport_stream
+                    status = 200
+                    content_type = "video/mp2t"
+                    transformed_kind = "png-ts"
+
+        if transformed_kind or upstream_status >= 400 or kind == "manifest":
+            print("[media-proxy] " + json.dumps({
+                "kind": kind,
+                "upstream_status": upstream_status,
+                "output_status": status,
+                "range": bool(range_header),
+                "content_type": content_type[:100],
+                "upstream_bytes": upstream_bytes,
+                "output_bytes": len(body),
+                "transformed": transformed_kind or "none",
+            }, ensure_ascii=False), flush=True)
 
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
-        if not transformed:
+        if not transformed_kind:
             for name in ("Accept-Ranges", "Content-Range"):
                 value = response.headers.get(name)
                 if value:

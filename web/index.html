@@ -214,7 +214,7 @@
     </div>
   </dialog>
 
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.16/dist/hls.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/hls.js@1.6.16/dist/hls.min.js"></script>
   <script>
     const statusElement = document.querySelector("#status");
     const siteSearch = document.querySelector("#site-search");
@@ -252,8 +252,34 @@
       loading: false,
       count: 0,
       requestId: 0,
+      homeRequestId: 0,
       hls: null,
     };
+
+    const HOME_BROWSER_CACHE_TTL = 10 * 60 * 1000;
+
+    function homeCacheKey(site) {
+      const modified = state.plugins.find((plugin) => plugin.id === site)?.modified || 0;
+      return `hkl.home.v1.${encodeURIComponent(site)}.${modified}`;
+    }
+
+    function readCachedHome(site) {
+      try {
+        const cached = JSON.parse(localStorage.getItem(homeCacheKey(site)) || "null");
+        if (!cached || Date.now() - cached.savedAt > HOME_BROWSER_CACHE_TTL) return null;
+        return cached.value;
+      } catch {
+        return null;
+      }
+    }
+
+    function writeCachedHome(site, value) {
+      try {
+        localStorage.setItem(homeCacheKey(site), JSON.stringify({ savedAt: Date.now(), value }));
+      } catch {
+        // 浏览器禁用存储或容量不足时只使用服务端缓存。
+      }
+    }
 
     async function fetchJson(path) {
       const response = await fetch(path);
@@ -388,30 +414,50 @@
         button.addEventListener("click", () => selectCategory(typeId, typeName));
         categoryElement.append(button);
       }
-      if (categoryElement.firstElementChild) {
+      if (homeItems.length > 0) {
+        setActiveCategory("");
+        renderVideos(homeItems, false);
+        statusElement.textContent = `首页推荐 · 已加载 ${state.count} 个项目`;
+      } else if (categoryElement.firstElementChild) {
         categoryElement.firstElementChild.click();
       } else {
-        renderVideos(homeItems, false);
-        statusElement.textContent = `首页 · 已加载 ${state.count} 个项目`;
+        renderVideos([], false);
+        statusElement.textContent = "首页没有返回分类或影片";
       }
     }
 
     async function loadHome() {
-      if (!state.site) return;
-      statusElement.textContent = `正在加载 ${siteSelect.selectedOptions[0]?.textContent || "数据源"}……`;
+      const site = state.site;
+      if (!site) return;
+      const homeRequestId = ++state.homeRequestId;
+      const sourceName = siteSelect.selectedOptions[0]?.textContent || "数据源";
       categoryElement.replaceChildren();
       videoElement.replaceChildren();
       loadMoreButton.hidden = true;
+
+      const cached = readCachedHome(site);
+      if (cached) {
+        const categories = Array.isArray(cached.categories) ? cached.categories : [];
+        const items = Array.isArray(cached.items) ? cached.items : [];
+        statusElement.textContent = `${sourceName} · 正在读取缓存……`;
+        renderCategories(categories, items);
+        return;
+      }
+
+      statusElement.textContent = `正在加载 ${sourceName}……`;
       try {
-        const params = new URLSearchParams({ site: state.site });
+        const params = new URLSearchParams({ site });
         const result = await fetchJson(`/api/home?${params}`);
+        if (homeRequestId !== state.homeRequestId || site !== state.site) return;
         const categories = Array.isArray(result.categories) ? result.categories : [];
         const items = Array.isArray(result.items) ? result.items : [];
         if (categories.length === 0 && items.length === 0) {
           throw new Error("插件首页没有返回分类或影片");
         }
+        writeCachedHome(site, { categories, items });
         renderCategories(categories, items);
       } catch (error) {
+        if (homeRequestId !== state.homeRequestId || site !== state.site) return;
         statusElement.textContent = `加载失败：${error.message}`;
         console.error(error);
       }
@@ -460,7 +506,11 @@
         const plugins = Array.isArray(result.plugins) ? result.plugins : [];
         if (plugins.length === 0) throw new Error("py 目录中没有插件");
         state.plugins = plugins;
-        const preferred = plugins.find((plugin) => plugin.id === "布布追剧.py") || plugins[0];
+        let savedSite = "";
+        try { savedSite = localStorage.getItem("hkl.selectedSite") || ""; } catch { /* 忽略存储限制 */ }
+        const preferred = plugins.find((plugin) => plugin.id === savedSite)
+          || plugins.find((plugin) => plugin.id === "布布追剧.py")
+          || plugins[0];
         state.site = preferred.id;
         renderPluginOptions();
         siteSelect.value = preferred.id;
@@ -486,6 +536,7 @@
       const nextSite = siteSelect.value;
       if (!nextSite) return;
       state.site = nextSite;
+      try { localStorage.setItem("hkl.selectedSite", nextSite); } catch { /* 忽略存储限制 */ }
       siteSearch.value = "";
       renderPluginOptions();
       siteSelect.value = nextSite;

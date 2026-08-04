@@ -72,7 +72,9 @@
       box-shadow: 0 24px 60px rgb(0 0 0 / 32%);
     }
     .video-stage { position: relative; width: 100%; max-height: 72vh; aspect-ratio: 16 / 9; overflow: hidden; background: #000; border-radius: 11px; box-shadow: inset 0 0 0 1px rgb(255 255 255 / 5%); }
-    #video-player { display: block; width: 100%; height: 100%; object-fit: contain; background: #000; }
+    #video-player, #embed-player { display: block; width: 100%; height: 100%; background: #000; }
+    #video-player { object-fit: contain; }
+    #embed-player { border: 0; }
     #video-player.seek-loading::-webkit-media-controls-overlay-enclosure,
     #video-player.seek-loading::-webkit-media-controls-overlay-play-button { display: none !important; }
     .seek-loader { position: absolute; inset: 0; z-index: 2; display: grid; place-items: center; pointer-events: none; background: transparent; }
@@ -131,6 +133,7 @@
         <section id="player-panel">
           <div class="video-stage">
             <video id="video-player" controls playsinline></video>
+            <iframe id="embed-player" title="平台播放器" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen hidden></iframe>
             <div id="seek-loader" class="seek-loader" role="status" aria-label="正在跳转播放位置" hidden>
               <span class="seek-spinner" aria-hidden="true"></span>
             </div>
@@ -174,6 +177,8 @@
       episodeOrder: "asc",
       activeEpisodeVid: "",
       resumeAfterSeek: false,
+      debugId: (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`)
+        .replaceAll("-", "").slice(0, 10),
     };
     const element = (id) => document.getElementById(id);
     const loading = element("loading");
@@ -184,14 +189,28 @@
     const episodeElement = element("episodes");
     const playerPanel = element("player-panel");
     const player = element("video-player");
+    const embedPlayer = element("embed-player");
     const seekLoader = element("seek-loader");
     const playerStatus = element("player-status");
     let pointerDownWasPlaying = false;
     let seekLoaderShownAt = 0;
     let seekLoaderTimer = null;
 
+    function reportPlayerLog(event, data = {}) {
+      const payload = { debugId: state.debugId, event, data };
+      const method = event.includes("error") || event.includes("failed") ? "error" : "info";
+      console[method](`[player:${state.debugId}] ${event}`, data);
+      fetch("/api/client-log", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        cache: "no-store",
+        keepalive: true,
+      }).catch(() => {});
+    }
+
     async function fetchJson(path) {
-      const response = await fetch(path);
+      const response = await fetch(path, { cache: "no-store" });
       let result;
       try { result = await response.json(); }
       catch { throw new Error(`服务器返回了无效数据（HTTP ${response.status}）`); }
@@ -242,6 +261,9 @@
       pointerDownWasPlaying = false;
       setSeekLoading(false, true);
       setPlayerLoading(false);
+      embedPlayer.hidden = true;
+      embedPlayer.removeAttribute("src");
+      player.hidden = false;
       player.pause();
       player.removeAttribute("src");
       player.load();
@@ -270,17 +292,33 @@
       setPlayerLoading(true);
     });
     player.addEventListener("seeked", () => {
-      if (player.readyState >= 2) markPlayerFrameReady();
+      setSeekLoading(false, true);
+      if (player.readyState >= 2) {
+        setPlayerLoading(false);
+        resumePlaybackAfterSeek();
+      }
     });
     player.addEventListener("waiting", () => {
-      if (player.currentSrc && !player.paused && !player.ended) setPlayerLoading(true);
+      if (player.currentSrc && !player.ended) {
+        setSeekLoading(false, true);
+        if (!player.paused) setPlayerLoading(true);
+      }
     });
     player.addEventListener("stalled", () => {
-      if (player.currentSrc && !player.ended) setPlayerLoading(true);
+      if (player.currentSrc && !player.ended) {
+        setSeekLoading(false, true);
+        setPlayerLoading(true);
+      }
     });
     player.addEventListener("error", () => {
       setSeekLoading(false, true);
       setPlayerLoading(false);
+      reportPlayerLog("video-error", {
+        code: player.error?.code || 0,
+        message: player.error?.message || mediaErrorMessage(),
+        readyState: player.readyState,
+        networkState: player.networkState,
+      });
     });
     player.addEventListener("ended", () => setSeekLoading(false, true));
 
@@ -369,14 +407,26 @@
       playerStatus.textContent = "正在解析播放地址……";
       for (const item of episodeElement.children) item.classList.remove("active");
       button.classList.add("active");
+      reportPlayerLog("episode-select", {
+        site: state.site,
+        flag,
+        episode: episode.name || "",
+        vid: String(episode.vid ?? "").slice(0, 300),
+      });
       try {
         const params = new URLSearchParams({ site: state.site, flag, vid: episode.vid });
         const result = await fetchJson(`/api/player?${params}`);
+        reportPlayerLog("player-api-result", {
+          mode: result?.mode,
+          isHls: result?.is_hls,
+          proxied: result?.proxied,
+          hasUrl: Boolean(result?.url),
+        });
         await attachPlayback(result);
       } catch (error) {
         setPlayerLoading(false);
         playerStatus.textContent = `播放失败：${error.message}。可以尝试其他片源。`;
-        console.error(error);
+        reportPlayerLog("player-failed", { message: error?.message || String(error) });
       }
     }
 
@@ -420,56 +470,89 @@
         let settled = false;
         let mediaRecoveryAttempts = 0;
         let networkRecoveryAttempts = 0;
+        let nonFatalLogs = 0;
         let timer;
         const finish = (error) => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
           if (error) {
+            reportPlayerLog("hls-failed", { message: error.message });
             hls.destroy();
             if (state.hls === hls) state.hls = null;
             reject(error);
           } else {
+            reportPlayerLog("hls-ready", { readyState: player.readyState });
             resolve();
           }
         };
         timer = setTimeout(() => finish(new Error("等待首个 HLS 分片超时")), 30000);
-        hls.on(window.Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(url));
-        hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
+        hls.on(window.Hls.Events.MEDIA_ATTACHED, () => {
+          reportPlayerLog("hls-media-attached");
+          hls.loadSource(url);
+        });
+        hls.on(window.Hls.Events.MANIFEST_PARSED, (_event, data) => {
+          reportPlayerLog("hls-manifest-parsed", { levels: data?.levels?.length || 0 });
           playerStatus.textContent = "播放清单已加载，正在缓冲首个分片……";
         });
-        hls.on(window.Hls.Events.FRAG_BUFFERED, () => finish());
+        hls.on(window.Hls.Events.FRAG_BUFFERED, (_event, data) => {
+          reportPlayerLog("hls-first-fragment", {
+            sn: data?.frag?.sn,
+            fragmentType: data?.frag?.type,
+          });
+          finish();
+        });
         hls.on(window.Hls.Events.ERROR, (_event, data) => {
+          const responseCode = Number(data.response?.code || 0);
+          if (data.fatal || nonFatalLogs < 3) {
+            reportPlayerLog("hls-error", {
+              fatal: Boolean(data.fatal),
+              type: data.type || "",
+              details: data.details || "",
+              responseCode,
+              error: data.error?.message || "",
+              sn: data.frag?.sn,
+              fragmentType: data.frag?.type,
+            });
+            if (!data.fatal) nonFatalLogs += 1;
+          }
           if (!data.fatal) return;
           if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveryAttempts < 1) {
             mediaRecoveryAttempts += 1;
             setPlayerLoading(true);
             playerStatus.textContent = "检测到媒体解码异常，正在恢复……";
+            reportPlayerLog("hls-recover-media", { attempt: mediaRecoveryAttempts });
             try {
               hls.recoverMediaError();
               return;
-            } catch {
-              // 继续执行统一失败处理。
+            } catch (error) {
+              reportPlayerLog("hls-recover-error", { message: error?.message || String(error) });
             }
           }
           if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR && networkRecoveryAttempts < 1) {
             networkRecoveryAttempts += 1;
             setPlayerLoading(true);
             playerStatus.textContent = "媒体网络中断，正在重试……";
+            reportPlayerLog("hls-retry-network", { attempt: networkRecoveryAttempts, responseCode });
             hls.startLoad();
             return;
           }
-          const code = data.response?.code ? `（HTTP ${data.response.code}）` : "";
-          const error = new Error(`HLS ${data.details || data.type || "加载失败"}${code}`);
+          const sourceUnavailable = [403, 404, 410].includes(responseCode);
+          const message = sourceUnavailable
+            ? `上游片源已失效或拒绝访问（HTTP ${responseCode}）`
+            : `HLS ${data.details || data.type || "加载失败"}${responseCode ? `（HTTP ${responseCode}）` : ""}`;
+          const error = new Error(message);
           if (!settled) {
             finish(error);
           } else {
             setPlayerLoading(false);
             playerStatus.textContent = `播放失败：${error.message}，请尝试其他片源`;
+            reportPlayerLog("hls-playback-failed", { message: error.message });
             hls.destroy();
             if (state.hls === hls) state.hls = null;
           }
         });
+        reportPlayerLog("hls-attach-start", { hlsVersion: window.Hls.version || "unknown" });
         hls.attachMedia(player);
       });
     }
@@ -477,21 +560,69 @@
     async function attachPlayback(result) {
       const url = typeof result === "string" ? result : result?.url;
       if (typeof url !== "string" || !url) throw new Error("没有取得播放地址");
+      const mode = typeof result === "object" ? result?.mode : "media";
+      reportPlayerLog("attach-playback", {
+        mode,
+        isHls: result?.is_hls,
+        proxied: result?.proxied,
+        nativeHls: player.canPlayType("application/vnd.apple.mpegurl") || "none",
+        hlsJsAvailable: Boolean(window.Hls),
+        hlsJsSupported: Boolean(window.Hls?.isSupported?.()),
+      });
+
+      if (mode === "embed") {
+        if (!url.startsWith("https://player.youku.com/embed/")) {
+          throw new Error("服务端返回了不受信任的平台播放器地址");
+        }
+        if (state.hls) { state.hls.destroy(); state.hls = null; }
+        setSeekLoading(false, true);
+        setPlayerLoading(false);
+        player.pause();
+        player.removeAttribute("src");
+        player.load();
+        player.hidden = true;
+        embedPlayer.hidden = false;
+        embedPlayer.src = url;
+        playerStatus.textContent = "已加载优酷官方播放器；如未自动播放，请点击画面中的播放按钮";
+        return;
+      }
+
+      embedPlayer.hidden = true;
+      embedPlayer.removeAttribute("src");
+      player.hidden = false;
       setPlayerLoading(true);
-      const isHls = /\.m3u8(?:$|[?#])/i.test(url);
+      const isHls = result?.is_hls === true || /\.m3u8(?:$|[?&#])/i.test(url);
+      const nativeHls = player.canPlayType("application/vnd.apple.mpegurl");
+      const hlsJsSupported = Boolean(window.Hls?.isSupported?.());
+      const safariNativeHls = Boolean(nativeHls)
+        && /Safari/i.test(navigator.userAgent)
+        && !/(?:Chrome|Chromium|CriOS|Edg|OPR|Android)/i.test(navigator.userAgent);
       playerStatus.textContent = "正在加载媒体……";
-      if (isHls && player.canPlayType("application/vnd.apple.mpegurl")) {
+      if (isHls && hlsJsSupported && !safariNativeHls) {
+        reportPlayerLog("playback-engine", { engine: "hls.js" });
+        await attachHls(url);
+      } else if (isHls && nativeHls) {
+        reportPlayerLog("playback-engine", { engine: "native-hls" });
         player.src = url;
         player.load();
         await waitForMediaReady();
-      } else if (isHls && window.Hls?.isSupported()) {
-        await attachHls(url);
       } else if (isHls) {
         throw new Error("当前浏览器不支持 HLS 播放");
       } else {
         player.src = url;
         player.load();
-        await waitForMediaReady();
+        try {
+          await waitForMediaReady();
+        } catch (error) {
+          if (player.error?.code !== 4 || !window.Hls?.isSupported()) throw error;
+          reportPlayerLog("native-format-rejected", {
+            code: player.error?.code || 0,
+            message: player.error?.message || mediaErrorMessage(),
+          });
+          player.removeAttribute("src");
+          player.load();
+          await attachHls(url);
+        }
       }
 
       playerStatus.textContent = "媒体已就绪";
@@ -509,20 +640,33 @@
     }
 
     async function loadDetail() {
+      reportPlayerLog("page-load", {
+        build: "20260804-player-debug-1",
+        site: state.site,
+        vodId: state.vodId.slice(0, 300),
+        hlsJsAvailable: Boolean(window.Hls),
+      });
       if (!state.site || !state.vodId) {
         loading.hidden = true;
         errorElement.hidden = false;
         errorElement.textContent = "详情链接缺少数据源或影片 ID";
+        reportPlayerLog("detail-error", { message: errorElement.textContent });
         return;
       }
       try {
         const params = new URLSearchParams({ site: state.site, vod_id: state.vodId });
-        renderDetail(await fetchJson(`/api/detail?${params}`));
+        reportPlayerLog("detail-request");
+        const detail = await fetchJson(`/api/detail?${params}`);
+        renderDetail(detail);
+        reportPlayerLog("detail-ready", {
+          name: detail?.vod_name || "",
+          sources: Array.isArray(detail?.sources) ? detail.sources.length : 0,
+        });
       } catch (error) {
         loading.hidden = true;
         errorElement.hidden = false;
         errorElement.textContent = `详情加载失败：${error.message}`;
-        console.error(error);
+        reportPlayerLog("detail-error", { message: error?.message || String(error) });
       }
     }
 
