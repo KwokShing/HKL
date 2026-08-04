@@ -1,0 +1,79 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'KwokShing/HKL'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge FGBLH/HKL
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp .gitignore /tmp/local.gitignore
+          git remote add upstream https://github.com/FGBLH/HKL.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/FGBLH/HKL.git
+          git fetch --no-tags upstream main
+          before=$(git rev-parse HEAD)
+          set +e
+          git merge --no-commit --no-ff upstream/main
+          merge_status=$?
+          set -e
+          if (( merge_status != 0 )); then
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            if (( ${#conflicts[@]} != 1 )) || [[ "${conflicts[0]:-}" != ".gitignore" ]]; then
+              printf '需要人工解决冲突：\n%s\n' "${conflicts[*]:-unknown}"
+              exit 1
+            fi
+            git checkout --theirs -- .gitignore 2>/dev/null || rm -f .gitignore
+          fi
+          python - <<'PY'
+          from pathlib import Path
+
+          lines = []
+          seen = set()
+          for source in (Path(".gitignore"), Path("/tmp/local.gitignore")):
+              if not source.is_file():
+                  continue
+              for line in source.read_text(encoding="utf-8-sig").splitlines():
+                  if line not in seen:
+                      seen.add(line)
+                      lines.append(line)
+          while lines and not lines[-1]:
+              lines.pop()
+          Path(".gitignore").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+          git add .gitignore
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            echo "仍有未解决冲突"
+            exit 1
+          fi
+          if [[ -f .git/MERGE_HEAD ]]; then
+            git commit --no-edit
+          fi
+          after=$(git rev-parse HEAD)
+          [[ "$before" != "$after" ]] && echo "changed=true" >> "$GITHUB_OUTPUT" || true
+
+      - name: Push synchronized main
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin HEAD:main
