@@ -51,6 +51,13 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 sys.path.insert(0, str(REPO_ROOT))
 
 
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+_BOT_USER_AGENT_RE = re.compile(r"^\s*(?:python-requests|python-urllib|urllib|httpx|aiohttp|curl|wget)", re.I)
+
+
 class PluginError(RuntimeError):
     pass
 
@@ -203,8 +210,40 @@ def _worker_main(connection: Any, plugin_path: str, site_id: str, base_url: str)
             url = str(args[1] if len(args) > 1 else kwargs.get("url", ""))
             if kwargs.get("timeout") is None:
                 kwargs["timeout"] = 5 if import_in_progress else 20
+
+            def send(**overrides: Any) -> Any:
+                return original_request(session, *args, **{**kwargs, **overrides})
+
+            overrides: dict[str, Any] = {}
             try:
-                return original_request(session, *args, **kwargs)
+                try:
+                    response = send()
+                except requests.exceptions.SSLError as exc:
+                    if kwargs.get("verify") is not None:
+                        raise
+                    # 证书链不完整的 CDN：仅本次请求降级校验，插件代码无需改动
+                    print(f"[{site_id}] TLS 校验失败，改用免校验重试：{url[:160]}（{exc}）", flush=True)
+                    overrides["verify"] = False
+                    response = send(**overrides)
+                if method == "GET" and response.status_code in {401, 403, 406, 412, 451}:
+                    merged = {**dict(session.headers or {}), **(kwargs.get("headers") or {})}
+                    agent = next(
+                        (str(value) for name, value in merged.items() if str(name).lower() == "user-agent"),
+                        "",
+                    )
+                    if _BOT_USER_AGENT_RE.match(agent):
+                        overrides["headers"] = {
+                            **(kwargs.get("headers") or {}),
+                            "User-Agent": BROWSER_UA,
+                        }
+                        retried = send(**overrides)
+                        if retried.status_code < 400:
+                            print(
+                                f"[{site_id}] {response.status_code} 拦截脚本 UA，改用浏览器 UA 成功：{url[:160]}",
+                                flush=True,
+                            )
+                            response = retried
+                return response
             except requests.RequestException as exc:
                 if not import_in_progress or method != "GET":
                     raise
@@ -285,7 +324,14 @@ def _worker_main(connection: Any, plugin_path: str, site_id: str, base_url: str)
                     (data["vid"],),
                 ])
             elif operation == "local_proxy":
-                result = _invoke(instance, "localProxy", [(data,)])
+                # 多数插件按 dict 取参，少数按查询字符串处理，两种都试
+                query = str(data.pop("__query__", ""))
+                try:
+                    result = _invoke(instance, "localProxy", [(data,)])
+                except Exception:
+                    if not query:
+                        raise
+                    result = _invoke(instance, "localProxy", [(query,)])
             else:
                 raise PluginError("未知插件操作")
             connection.send({"ok": True, "result": result})
@@ -490,6 +536,11 @@ def normalize_detail(result: Any) -> dict[str, Any]:
         raise PluginError("详情数据格式错误")
     source_names = str(video.get("vod_play_from") or "").split("$$$")
     source_values = str(video.get("vod_play_url") or "").split("$$$")
+    # 有插件把片源名用 # 拼接（TVBox 规范是 $$$），数量能对上时按 # 还原
+    if len(source_names) == 1 and len(source_values) > 1 and "#" in source_names[0]:
+        hashed_names = [name for name in source_names[0].split("#") if name]
+        if len(hashed_names) == len(source_values):
+            source_names = hashed_names
     sources = []
     for index, (name, play_list) in enumerate(zip_longest(source_names, source_values, fillvalue="")):
         episodes = []
@@ -563,6 +614,173 @@ def youku_embed_url(url: str) -> str:
     return f"https://player.youku.com/embed/{quote(video_id, safe='=_-')}"
 
 
+def _first_param_value(params: dict[str, Any], key: str) -> str:
+    value = params.get(key)
+    if isinstance(value, (list, tuple)):
+        return str(value[0]) if value else ""
+    return str(value or "")
+
+
+PAGE_RESOLVE_TIMEOUT = (10, 20)
+PAGE_RESOLVE_MAX_BYTES = 3 * 1024 * 1024
+PAGE_RESOLVE_MAX_DEPTH = 2
+_PAGE_MEDIA_CACHE: dict[str, tuple[float, str]] = {}
+_PAGE_MEDIA_CACHE_LOCK = threading.Lock()
+PAGE_MEDIA_CACHE_TTL = 300
+_MEDIA_IN_PAGE_RE = re.compile(
+    r"https?://[^\s\"'<>\\]+?\.(?:m3u8|mp4|m4v|webm|flv|mkv|mpd)(?:\?[^\s\"'<>\\]*)?", re.I
+)
+_AD_URL_HINT_RE = re.compile(r"(?:^|[/_.-])(?:ads?|advert|guanggao|gg)(?:[/_.-]|\d|$)", re.I)
+
+
+def _unescape_page_url(value: str) -> str:
+    return unescape(str(value or "")).replace("\\/", "/").replace("\\u002F", "/").replace("\\u002f", "/")
+
+
+def _decode_maccms_url(raw: str, encrypt: Any) -> str:
+    value = _unescape_page_url(raw)
+    if not value:
+        return ""
+    try:
+        code = int(encrypt)
+    except (TypeError, ValueError):
+        code = 1 if "%" in value else 0
+    if code == 2:
+        import base64
+
+        padded = value + "=" * (-len(value) % 4)
+        try:
+            value = base64.b64decode(padded).decode("utf-8", "replace")
+        except Exception:
+            return ""
+    if code in (1, 2) or "%" in value:
+        value = unquote(value)
+    return value.strip()
+
+
+def extract_maccms_player_url(page: str) -> str:
+    """解析 MacCMS/苹果CMS 播放页里的 player_aaaa 配置（末尾可能没有分号）。"""
+    for match in re.finditer(
+        r"(?:var|let|const)\s+player_(?:aaaa|config|data)\s*=\s*(\{.*?\})\s*(?:;|</script>|\r?\n\s*(?:var|let|const)\s)",
+        page,
+        re.S,
+    ):
+        block = match.group(1)
+        payload: Any = None
+        try:
+            payload = json.loads(block)
+        except json.JSONDecodeError:
+            pass
+        if isinstance(payload, dict):
+            url = _decode_maccms_url(payload.get("url"), payload.get("encrypt"))
+        else:
+            raw = re.search(r'"url"\s*:\s*"([^"]*)"', block)
+            encrypt = re.search(r'"encrypt"\s*:\s*"?(\d+)"?', block)
+            url = _decode_maccms_url(raw.group(1) if raw else "", encrypt.group(1) if encrypt else None)
+        if url.startswith(("http://", "https://")):
+            return url
+    return ""
+
+
+def _iframe_candidates(page: str, base_url: str) -> list[str]:
+    found = []
+    for src in re.findall(r"<iframe[^>]+src=[\"']([^\"']+)[\"']", page, re.I):
+        candidate = _unescape_page_url(src)
+        if not candidate or candidate.startswith(("javascript:", "about:", "data:")):
+            continue
+        absolute = urljoin(base_url, candidate)
+        if not absolute.startswith(("http://", "https://")) or _AD_URL_HINT_RE.search(absolute):
+            continue
+        if absolute not in found:
+            found.append(absolute)
+    return found
+
+
+def _fetch_page(url: str, headers: dict[str, Any]) -> str:
+    request_headers = {
+        "User-Agent": BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+    for name, value in (headers or {}).items():
+        text = str(value)
+        if "\r" in text or "\n" in text:
+            continue
+        request_headers[str(name)] = text
+    request_headers.setdefault("Referer", url)
+    response = requests.get(
+        url, headers=request_headers, timeout=PAGE_RESOLVE_TIMEOUT, verify=False, stream=True
+    )
+    response.raise_for_status()
+    content_type = str(response.headers.get("Content-Type", "")).lower()
+    if content_type and not any(
+        token in content_type for token in ("text/", "html", "javascript", "json", "xml")
+    ):
+        response.close()
+        return ""
+    body = response.raw.read(PAGE_RESOLVE_MAX_BYTES, decode_content=True) or b""
+    response.close()
+    charset = ""
+    match = re.search(r"charset=([\w-]+)", content_type)
+    if match:
+        charset = match.group(1)
+    if not charset:
+        meta = re.search(rb"charset=[\"']?([\w-]+)", body[:2048], re.I)
+        charset = meta.group(1).decode("ascii", "ignore") if meta else "utf-8"
+    try:
+        return body.decode(charset, "replace")
+    except LookupError:
+        return body.decode("utf-8", "replace")
+
+
+def resolve_page_media(url: str, headers: dict[str, Any], depth: int = 0) -> str:
+    """把播放网页解析成可直接播放的媒体直链，失败返回空字符串。"""
+    if depth >= PAGE_RESOLVE_MAX_DEPTH or not url.startswith(("http://", "https://")):
+        return ""
+    if depth == 0:
+        with _PAGE_MEDIA_CACHE_LOCK:
+            cached = _PAGE_MEDIA_CACHE.get(url)
+            if cached and time.time() - cached[0] < PAGE_MEDIA_CACHE_TTL:
+                return cached[1]
+    try:
+        page = _fetch_page(url, headers)
+    except Exception as exc:
+        print(f"[page-resolve] 抓取失败 {url[:200]} -> {exc}", flush=True)
+        return ""
+    if not page:
+        return ""
+
+    resolved = extract_maccms_player_url(page)
+    if resolved and not is_direct_media_url(resolved):
+        nested = resolve_page_media(resolved, {**(headers or {}), "Referer": url}, depth + 1)
+        resolved = nested or ""
+    if not resolved:
+        for candidate in _MEDIA_IN_PAGE_RE.findall(page):
+            candidate = _unescape_page_url(candidate)
+            if _AD_URL_HINT_RE.search(urlsplit(candidate).path):
+                continue
+            resolved = candidate
+            break
+    if not resolved:
+        for frame in _iframe_candidates(page, url):
+            if is_direct_media_url(frame):
+                resolved = frame
+                break
+            nested = resolve_page_media(frame, {**(headers or {}), "Referer": url}, depth + 1)
+            if nested:
+                resolved = nested
+                break
+
+    if resolved and depth == 0:
+        with _PAGE_MEDIA_CACHE_LOCK:
+            if len(_PAGE_MEDIA_CACHE) >= 512:
+                _PAGE_MEDIA_CACHE.clear()
+            _PAGE_MEDIA_CACHE[url] = (time.time(), resolved)
+    if resolved:
+        print(f"[page-resolve] {url[:160]} -> {resolved[:160]}", flush=True)
+    return resolved
+
+
 def normalize_player(result: Any) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise PluginError("playerContent 没有返回字典")
@@ -590,9 +808,17 @@ def normalize_player(result: Any) -> dict[str, Any]:
             "options": options,
             "headers": {},
         }
-    if requires_parse and not is_direct_media_url(url):
-        raise PluginError("该片源返回的是平台网页，需要 TVBox 外部解析；请选择其他片源")
-    return {
+    source_url = ""
+    looks_like_web_page = bool(re.search(r"\.(?:html?|shtml|php|asp|aspx|jsp)(?:$|[?&#])", url, re.I))
+    if not is_direct_media_url(url) and (requires_parse or looks_like_web_page):
+        resolved = resolve_page_media(url, headers)
+        if resolved:
+            source_url = url
+            headers = {**headers, "Referer": headers.get("Referer") or url}
+            url = resolved
+        elif requires_parse:
+            raise PluginError("该片源返回的是平台网页，站内解析未找到直链；请选择其他片源")
+    player = {
         "url": url,
         "mode": "media",
         "is_hls": is_hls_url(url),
@@ -600,6 +826,10 @@ def normalize_player(result: Any) -> dict[str, Any]:
         "options": options,
         "headers": headers,
     }
+    if source_url:
+        player["source_url"] = source_url
+        player["resolved_from_page"] = True
+    return player
 
 
 def register_media_target(url: str, headers: dict[str, Any], kind: str = "media") -> str:
@@ -702,9 +932,32 @@ def rewrite_dash_manifest(data: bytes, base_url: str, headers: dict[str, str]) -
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
+def _is_own_proxy_url(value: str) -> bool:
+    """判断地址是否已经指向本机代理，避免二次代理。"""
+    if value.startswith("/api/"):
+        return True
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return False
+    return parts.hostname in {HOST, "localhost", "127.0.0.1"} and parts.path.startswith("/api/")
+
+
+def _relative_own_proxy_url(value: str) -> str:
+    """把本机绝对代理地址转成相对路径，避免端口不一致导致的跨源问题。"""
+    if value.startswith("/"):
+        return value
+    parts = urlsplit(value)
+    return urlunsplit(("", "", parts.path, parts.query, ""))
+
+
 def rewrite_media_manifest(text: str, base_url: str, headers: dict[str, str]) -> str:
     def proxy_url(value: str, kind: str) -> str:
+        if _is_own_proxy_url(value):
+            return value
         target = urljoin(base_url, value)
+        if _is_own_proxy_url(target):
+            return target
         return (
             register_media_target(target, headers, kind=kind)
             if target.startswith(("http://", "https://"))
@@ -977,7 +1230,14 @@ class Handler(SimpleHTTPRequestHandler):
             return
         try:
             player = normalize_player(result)
-            if player["mode"] == "media":
+            if player.get("resolved_from_page") and player["mode"] == "media":
+                # 站内解析出直链后再交给插件一次，让它的代理/去广告逻辑仍然生效
+                player = self.replay_player_with_direct_url(site, self.first(params, "flag"), player)
+            if player["mode"] == "media" and _is_own_proxy_url(player["url"]):
+                # 插件已经走本机 localProxy（例如 m3u8 去广告），不要再套一层媒体代理
+                player["url"] = _relative_own_proxy_url(player["url"])
+                player["proxied"] = True
+            elif player["mode"] == "media":
                 if player["is_hls"]:
                     player["url"] = register_media_target(
                         player["url"], player["headers"], kind="manifest"
@@ -1002,6 +1262,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "is_hls": player.get("is_hls"),
                 "is_dash": player.get("is_dash"),
                 "proxied": player.get("proxied", False),
+                "resolved_from_page": player.get("resolved_from_page", False),
                 "source_url": str(player.get("source_url") or result.get("url") or "")[:500]
                     if isinstance(result, dict) else "",
                 "output_url": str(player.get("url") or "")[:500],
@@ -1015,6 +1276,27 @@ class Handler(SimpleHTTPRequestHandler):
                 "result": str(result)[:1000],
             }, ensure_ascii=False), flush=True)
             self.send_json(422, {"error": str(exc)})
+
+    def replay_player_with_direct_url(
+        self, site: str, flag: str, player: dict[str, Any]
+    ) -> dict[str, Any]:
+        direct_url = player["url"]
+        try:
+            result = get_runtime(site).call("player", {"flag": flag, "vid": direct_url})
+            replayed = normalize_player(result)
+        except (PluginError, EOFError, BrokenPipeError, OSError) as exc:
+            print(f"[player-replay] {site} 直链回喂失败，沿用站内解析结果：{exc}", flush=True)
+            return player
+        if replayed["mode"] != "media":
+            return player
+        if replayed["url"] != direct_url and not _is_own_proxy_url(replayed["url"]):
+            # 插件换出了别的地址（可能又是网页），不予采纳
+            return player
+        replayed["source_url"] = player.get("source_url", "")
+        replayed["resolved_from_page"] = True
+        if not replayed.get("headers"):
+            replayed["headers"] = player.get("headers", {})
+        return replayed
 
     def api_dash_media(self, parsed: Any) -> None:
         remainder = parsed.path[len("/api/dash-media/"):]
@@ -1232,29 +1514,77 @@ class Handler(SimpleHTTPRequestHandler):
         if site is None:
             return
         proxy_params = {key: values[0] if len(values) == 1 else values for key, values in params.items() if key != "site"}
-        result = self.call_plugin(site, "local_proxy", proxy_params)
-        if result is None:
-            return
-        if not isinstance(result, (list, tuple)) or len(result) < 3:
-            self.send_json(502, {"error": "localProxy 返回格式错误"})
-            return
+        raw_query = "&".join(
+            f"{quote(key, safe='')}={quote(value, safe='')}"
+            for key, values in params.items()
+            if key != "site"
+            for value in values
+        )
+        target_url = unquote(_first_param_value(proxy_params, "url"))
+        referer = unquote(_first_param_value(proxy_params, "referer"))
+        upstream_headers = {"User-Agent": BROWSER_UA}
+        if referer:
+            upstream_headers["Referer"] = referer if referer.endswith("/") else referer + "/"
+
+        status, content_type, body, failure = 502, "application/octet-stream", b"", ""
         try:
-            status = int(result[0])
-        except (TypeError, ValueError):
-            status = 200
-        content_type = str(result[1] or "application/octet-stream")
-        content = result[2]
-        if isinstance(content, bytes):
-            body = content
-        elif isinstance(content, bytearray):
-            body = bytes(content)
-        elif isinstance(content, list) and all(isinstance(item, int) for item in content):
-            body = bytes(content)
-        else:
-            body = str(content or "").encode("utf-8")
+            result = get_runtime(site).call("local_proxy", {**proxy_params, "__query__": raw_query})
+        except (PluginError, EOFError, BrokenPipeError, OSError) as exc:
+            result, failure = None, f"localProxy 调用失败：{exc}"
+        if result is not None:
+            if not isinstance(result, (list, tuple)) or len(result) < 3:
+                failure = "localProxy 返回格式错误"
+            else:
+                try:
+                    status = int(result[0])
+                except (TypeError, ValueError):
+                    status = 200
+                content_type = str(result[1] or "application/octet-stream")
+                content = result[2]
+                if isinstance(content, (bytes, bytearray)):
+                    body = bytes(content)
+                elif isinstance(content, list) and all(isinstance(item, int) for item in content):
+                    body = bytes(content)
+                else:
+                    body = str(content or "").encode("utf-8")
+                if not 200 <= status < 300:
+                    failure = f"localProxy 返回 {status}"
+
+        manifest_text = decode_media_manifest(body) if 200 <= status < 300 else None
+        fallback = ""
+        if manifest_text is None and is_hls_url(target_url):
+            # 插件的清洗/下载失败时，服务端直接取原始清单，至少保证能播
+            try:
+                response = requests.get(
+                    target_url, headers=upstream_headers, timeout=30, verify=False, allow_redirects=True
+                )
+                response.raise_for_status()
+                manifest_text = decode_media_manifest(response.content)
+                if manifest_text is not None:
+                    target_url = response.url
+                    fallback = failure or "localProxy 未返回播放清单"
+                    status = 200
+            except requests.RequestException as exc:
+                failure = failure or f"原始清单抓取失败：{exc}"
+
+        if manifest_text is not None:
+            body = rewrite_media_manifest(manifest_text, target_url, upstream_headers).encode("utf-8")
+            content_type = "application/vnd.apple.mpegurl; charset=utf-8"
+            print("[local-proxy] " + json.dumps({
+                "site": site,
+                "url": target_url[:200],
+                "referer": upstream_headers.get("Referer", "")[:120],
+                "output_bytes": len(body),
+                "fallback": fallback,
+            }, ensure_ascii=False), flush=True)
+        elif failure and not body:
+            print(f"[local-proxy-error] {site} {failure}", flush=True)
+            self.send_json(502, {"error": failure})
+            return
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

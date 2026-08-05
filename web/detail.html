@@ -427,6 +427,7 @@
           isHls: result?.is_hls,
           isDash: result?.is_dash,
           proxied: result?.proxied,
+          resolvedFromPage: result?.resolved_from_page === true,
           hasUrl: Boolean(result?.url),
         });
         await attachPlayback(result);
@@ -632,6 +633,7 @@
         isHls: result?.is_hls,
         isDash: result?.is_dash,
         proxied: result?.proxied,
+        resolvedFromPage: result?.resolved_from_page === true,
         nativeHls: player.canPlayType("application/vnd.apple.mpegurl") || "none",
         hlsJsAvailable: Boolean(window.Hls),
         hlsJsSupported: Boolean(window.Hls?.isSupported?.()),
