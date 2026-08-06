@@ -63,6 +63,26 @@ class PluginError(RuntimeError):
     pass
 
 
+_OPERATION_LABELS = {
+    "home": "首页",
+    "category": "该分类",
+    "search": "搜索",
+    "detail": "该影片",
+    "player": "该片源",
+}
+
+
+def describe_plugin_error(message: str, operation: str = "") -> str:
+    """把插件抛出的裸异常翻译成能看懂的说明。"""
+    text = str(message).strip()
+    label = _OPERATION_LABELS.get(operation, "该请求")
+    if re.match(r"^(?:KeyError|IndexError):", text) or "has no attribute" in text:
+        return f"{label}在插件里缺少必要状态或字段（{text}），站点接口可能已改版；换个分类或数据源试试"
+    if re.match(r"^(?:JSONDecodeError|ValueError):", text) and "json" in text.lower():
+        return f"{label}返回的不是合法 JSON（{text}），站点可能在拦截请求"
+    return text
+
+
 class PluginTimeout(PluginError):
     pass
 
@@ -1430,7 +1450,7 @@ class Handler(SimpleHTTPRequestHandler):
         except PluginTimeout as exc:
             self.send_json(504, {"error": str(exc)})
         except PluginError as exc:
-            self.send_json(502, {"error": str(exc)})
+            self.send_json(502, {"error": describe_plugin_error(str(exc), operation)})
         except (EOFError, BrokenPipeError, OSError) as exc:
             self.send_json(502, {"error": f"插件 worker 异常：{exc}"})
         return None
