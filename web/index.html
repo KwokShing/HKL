@@ -482,14 +482,28 @@
       const current = state.plugins.find((plugin) => plugin.id === state.site);
       if (current && !visible.some((plugin) => plugin.id === current.id)) visible.unshift(current);
 
+      // ok海豚665 配置里出现过的源排在上方，按配置顺序；其余的排在分割线下方
+      const featured = visible
+        .filter((plugin) => plugin.featured_rank >= 0)
+        .sort((a, b) => a.featured_rank - b.featured_rank);
+      const others = visible.filter((plugin) => !(plugin.featured_rank >= 0));
+
       siteSelect.replaceChildren();
-      for (const plugin of visible) {
+      const appendOption = (plugin) => {
         const option = document.createElement("option");
         option.value = plugin.id;
         const isCurrentOnly = keyword && plugin.id === state.site && !matches.some((item) => item.id === plugin.id);
         option.textContent = `${pluginOptionText(plugin)}${isCurrentOnly ? " [当前]" : ""}`;
         siteSelect.append(option);
+      };
+      featured.forEach(appendOption);
+      if (featured.length && others.length) {
+        const separator = document.createElement("option");
+        separator.disabled = true;
+        separator.textContent = "──────────";
+        siteSelect.append(separator);
       }
+      others.forEach(appendOption);
       if (keyword && matches.length === 0) {
         const empty = document.createElement("option");
         empty.disabled = true;

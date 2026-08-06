@@ -120,6 +120,50 @@ def _scan_plugins() -> list[dict[str, Any]]:
     return plugins
 
 
+FEATURED_SOURCE_FILE = REPO_ROOT / "ok海豚665"
+_FEATURED_LOCK = threading.Lock()
+_FEATURED_SIGNATURE: tuple[int, int] | None = None
+_FEATURED_ORDER: dict[str, int] = {}
+
+
+def load_featured_sites() -> dict[str, int]:
+    """读取 ok海豚665（TVBox 配置，内容是 JSON 但文件名没有扩展名）。
+
+    取出 sites[].api 指向 py/ 脚本的条目，返回 {插件文件名: 配置里的次序}。
+    按文件 mtime+size 缓存，页面加载时只会真正解析一次。
+    """
+    global _FEATURED_SIGNATURE, _FEATURED_ORDER
+
+    try:
+        stat = FEATURED_SOURCE_FILE.stat()
+    except OSError:
+        return {}
+    signature = (stat.st_mtime_ns, stat.st_size)
+    with _FEATURED_LOCK:
+        if signature == _FEATURED_SIGNATURE:
+            return _FEATURED_ORDER
+        order: dict[str, int] = {}
+        try:
+            payload = json.loads(FEATURED_SOURCE_FILE.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as exc:
+            print(f"[featured] 解析 {FEATURED_SOURCE_FILE.name} 失败：{exc}", flush=True)
+            payload = {}
+        sites = payload.get("sites") if isinstance(payload, dict) else None
+        for entry in sites or []:
+            if not isinstance(entry, dict):
+                continue
+            api = str(entry.get("api") or "")
+            file_name = unquote(api.rsplit("/", 1)[-1].split("?", 1)[0].split("#", 1)[0])
+            # 只认指向 py 脚本的源，js/jar/csp_/接口地址一律跳过
+            if not file_name.lower().endswith(".py") or "/" in file_name or "\\" in file_name:
+                continue
+            order.setdefault(file_name, len(order))
+        _FEATURED_SIGNATURE = signature
+        _FEATURED_ORDER = order
+        print(f"[featured] {FEATURED_SOURCE_FILE.name}: {len(order)} 个 py 源", flush=True)
+        return order
+
+
 def _plugin_directory_signature() -> tuple[tuple[str, int, int], ...]:
     entries = []
     for path in sorted(PY_DIR.glob("*.py"), key=lambda item: item.name.casefold()):
@@ -1377,7 +1421,16 @@ class Handler(SimpleHTTPRequestHandler):
         return None
 
     def api_plugins(self, _params: dict[str, list[str]]) -> None:
-        self.send_json(200, {"plugins": discover_plugins()})
+        featured = load_featured_sites()
+        plugins = [
+            {**plugin, "featured_rank": featured.get(plugin["id"], -1)}
+            for plugin in discover_plugins()
+        ]
+        self.send_json(200, {
+            "plugins": plugins,
+            "featured_source": FEATURED_SOURCE_FILE.name,
+            "featured_total": sum(1 for plugin in plugins if plugin["featured_rank"] >= 0),
+        })
 
     def api_home(self, params: dict[str, list[str]]) -> None:
         site = self.require_site(params)
