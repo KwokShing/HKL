@@ -338,6 +338,45 @@ def _worker_main(connection: Any, plugin_path: str, site_id: str, base_url: str)
         connection.close()
         return
 
+    home_invoked = False
+
+    def dispatch(operation: str, data: dict[str, Any]) -> Any:
+        nonlocal home_invoked
+        if operation == "home":
+            home_invoked = True
+            return _invoke(instance, "homeContent", [(False,), ()])
+        if operation == "category":
+            return _invoke(instance, "categoryContent", [
+                (data["tid"], str(data["page"]), False, data.get("extend", {})),
+                (data["tid"], str(data["page"]), False),
+                (data["tid"], str(data["page"])),
+            ])
+        if operation == "search":
+            return _invoke(instance, "searchContent", [
+                (data["keyword"], False, str(data["page"])),
+                (data["keyword"], False),
+                (data["keyword"],),
+            ])
+        if operation == "detail":
+            return _invoke(instance, "detailContent", [([data["vod_id"]],), (data["vod_id"],)])
+        if operation == "player":
+            return _invoke(instance, "playerContent", [
+                (data.get("flag", ""), data["vid"], []),
+                (data.get("flag", ""), data["vid"], None),
+                (data.get("flag", ""), data["vid"]),
+                (data["vid"],),
+            ])
+        if operation == "local_proxy":
+            # 多数插件按 dict 取参，少数按查询字符串处理，两种都试
+            query = str(data.pop("__query__", ""))
+            try:
+                return _invoke(instance, "localProxy", [(data,)])
+            except Exception:
+                if not query:
+                    raise
+                return _invoke(instance, "localProxy", [(query,)])
+        raise PluginError("未知插件操作")
+
     while True:
         try:
             message = connection.recv()
@@ -345,40 +384,16 @@ def _worker_main(connection: Any, plugin_path: str, site_id: str, base_url: str)
             data = message.get("data", {})
             if operation == "stop":
                 break
-            if operation == "home":
-                result = _invoke(instance, "homeContent", [(False,), ()])
-            elif operation == "category":
-                result = _invoke(instance, "categoryContent", [
-                    (data["tid"], str(data["page"]), False, data.get("extend", {})),
-                    (data["tid"], str(data["page"]), False),
-                    (data["tid"], str(data["page"])),
-                ])
-            elif operation == "search":
-                result = _invoke(instance, "searchContent", [
-                    (data["keyword"], False, str(data["page"])),
-                    (data["keyword"], False),
-                    (data["keyword"],),
-                ])
-            elif operation == "detail":
-                result = _invoke(instance, "detailContent", [([data["vod_id"]],), (data["vod_id"],)])
-            elif operation == "player":
-                result = _invoke(instance, "playerContent", [
-                    (data.get("flag", ""), data["vid"], []),
-                    (data.get("flag", ""), data["vid"], None),
-                    (data.get("flag", ""), data["vid"]),
-                    (data["vid"],),
-                ])
-            elif operation == "local_proxy":
-                # 多数插件按 dict 取参，少数按查询字符串处理，两种都试
-                query = str(data.pop("__query__", ""))
-                try:
-                    result = _invoke(instance, "localProxy", [(data,)])
-                except Exception:
-                    if not query:
-                        raise
-                    result = _invoke(instance, "localProxy", [(query,)])
-            else:
-                raise PluginError("未知插件操作")
+            try:
+                result = dispatch(operation, data)
+            except (AttributeError, KeyError) as exc:
+                # 有些插件把状态建在 homeContent 里（如优酷的 self.typeid），
+                # 首页命中缓存或 worker 重启后直接翻分类就会缺状态，这里补跑一次首页再重试
+                if home_invoked or operation not in {"category", "search", "detail", "player"}:
+                    raise
+                print(f"[{site_id}] {operation} 缺少首页状态（{type(exc).__name__}: {exc}），补跑 homeContent 后重试", flush=True)
+                dispatch("home", {})
+                result = dispatch(operation, data)
             connection.send({"ok": True, "result": result})
         except EOFError:
             break
