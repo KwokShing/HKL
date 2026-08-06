@@ -254,9 +254,13 @@
       requestId: 0,
       homeRequestId: 0,
       hls: null,
+      sourceStats: {},
+      statsTimer: null,
     };
 
     const HOME_BROWSER_CACHE_TTL = 10 * 60 * 1000;
+    const SOURCE_STATS_POLL_INTERVAL = 3000;
+    const SOURCE_STATS_MAX_ROUNDS = 120;
 
     function homeCacheKey(site) {
       const modified = state.plugins.find((plugin) => plugin.id === site)?.modified || 0;
@@ -469,7 +473,9 @@
         : plugin.missing?.length
           ? ` [缺少 ${plugin.missing.join(", ")}]`
           : "";
-      return `${plugin.name}${suffix}`;
+      const stat = state.sourceStats[plugin.id];
+      const count = stat?.state === "ok" ? ` · ${stat.items}` : stat?.state === "failed" ? " · ✗" : "";
+      return `${plugin.name}${suffix}${count}`;
     }
 
     function renderPluginOptions(query = "") {
@@ -514,6 +520,36 @@
       siteSelect.disabled = state.plugins.length === 0;
     }
 
+    // 静默轮询：服务端跨数据源并行预取「首页 + 第一个分类」，把项目数写回下拉
+    async function pollSourceStats(round = 0) {
+      if (round >= SOURCE_STATS_MAX_ROUNDS) return;
+      const order = [
+        state.site,
+        ...state.plugins.filter((plugin) => plugin.featured_rank >= 0)
+          .sort((a, b) => a.featured_rank - b.featured_rank).map((plugin) => plugin.id),
+        ...state.plugins.map((plugin) => plugin.id),
+      ].filter((id, index, list) => id && list.indexOf(id) === index);
+      try {
+        const params = new URLSearchParams({ sites: order.join(",") });
+        const result = await fetchJson(`/api/source-stats?${params}`);
+        state.sourceStats = result?.stats || {};
+        // 下拉展开时重建 option 会把它关掉，等用户离开焦点再刷新
+        if (document.activeElement !== siteSelect) renderPluginOptions(siteSearch.value);
+        const done = (result?.pending || 0) === 0 && (result?.remaining || 0) === 0;
+        if (done) return;
+      } catch (error) {
+        console.warn("数据源统计轮询失败", error);
+      }
+      clearTimeout(state.statsTimer);
+      state.statsTimer = setTimeout(() => pollSourceStats(round + 1), SOURCE_STATS_POLL_INTERVAL);
+    }
+
+    function prefetchTabs(site) {
+      if (!site) return;
+      const params = new URLSearchParams({ site });
+      fetch(`/api/prefetch-tabs?${params}`).catch(() => { /* 预热失败不影响正常浏览 */ });
+    }
+
     async function loadPlugins() {
       try {
         const result = await fetchJson("/api/plugins");
@@ -530,6 +566,8 @@
         siteSelect.value = preferred.id;
         siteSearch.disabled = false;
         await loadHome();
+        prefetchTabs(state.site);
+        pollSourceStats();
       } catch (error) {
         statusElement.textContent = `插件扫描失败：${error.message}`;
         console.error(error);
@@ -562,6 +600,8 @@
       searchInput.value = "";
       searchClear.hidden = true;
       loadHome();
+      // 点进某个数据源后，后台把其余分类的第一页预热进缓存
+      prefetchTabs(nextSite);
     });
 
     searchForm.addEventListener("submit", (event) => {

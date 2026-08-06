@@ -46,7 +46,17 @@ _RESULT_CACHE_LOCK = threading.Lock()
 _RESULT_CACHE: dict[tuple[str, int, str, str], tuple[float, Any]] = {}
 _RESULT_CACHE_LIMIT = 1024
 HOME_CACHE_TTL = 600
-CATEGORY_CACHE_TTL = 180
+CATEGORY_CACHE_TTL = 600
+DISK_RESULT_CACHE_TTL = 12 * 3600
+DISK_RESULT_CACHE_LIMIT = 4096
+DISK_CACHEABLE_OPERATIONS = {"home", "category"}
+BACKGROUND_YIELD_TIMEOUT = 30
+PREFETCH_WORKERS = 3
+PREFETCH_SITE_BATCH = 12
+PREFETCH_CATEGORY_LIMIT = 12
+PREFETCH_TAB_WORKERS = 4
+BATCH_CALL_TIMEOUT = 120
+SOURCE_STATS_TTL = 12 * 3600
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 sys.path.insert(0, str(REPO_ROOT))
@@ -93,6 +103,24 @@ def _safe_plugin_path(file_name: str) -> Path:
         raise PluginError("插件不存在或路径无效")
     return candidate
 
+def _writes_instance_state(node: ast.AST) -> bool:
+    """方法里是否给 self.xxx（含下标）赋值——并发调用同一实例时的风险信号。"""
+    for inner in ast.walk(node):
+        if isinstance(inner, ast.Assign):
+            targets = inner.targets
+        elif isinstance(inner, (ast.AugAssign, ast.AnnAssign)):
+            targets = [inner.target]
+        else:
+            continue
+        for target in targets:
+            base = target
+            while isinstance(base, (ast.Subscript, ast.Attribute)):
+                if isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name) and base.value.id == "self":
+                    return True
+                base = base.value
+    return False
+
+
 def _scan_plugins() -> list[dict[str, Any]]:
     import warnings
 
@@ -100,6 +128,7 @@ def _scan_plugins() -> list[dict[str, Any]]:
     for path in sorted(PY_DIR.glob("*.py"), key=lambda item: item.name.casefold()):
         methods: set[str] = set()
         imports: set[str] = set()
+        stateful: set[str] = set()
         error = ""
         try:
             source = path.read_text(encoding="utf-8-sig", errors="replace")
@@ -109,6 +138,8 @@ def _scan_plugins() -> list[dict[str, Any]]:
             for node in ast.walk(tree):
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     methods.add(node.name)
+                    if _writes_instance_state(node):
+                        stateful.add(node.name)
                 elif isinstance(node, ast.Import):
                     imports.update(item.name.split(".")[0] for item in node.names)
                 elif isinstance(node, ast.ImportFrom) and node.module:
@@ -135,6 +166,7 @@ def _scan_plugins() -> list[dict[str, Any]]:
                 ),
                 "missing": missing,
                 "error": error,
+                "stateful": sorted(stateful),
             }
         )
     return plugins
@@ -225,7 +257,7 @@ def discover_plugins() -> list[dict[str, Any]]:
     global _PLUGIN_DISCOVERY_RESULT, _PLUGIN_DISCOVERY_SIGNATURE
 
     signature = _plugin_directory_signature()
-    cache_path = CACHE_DIR / "plugin-discovery.json"
+    cache_path = CACHE_DIR / "plugin-discovery-v2.json"
     with _PLUGIN_DISCOVERY_LOCK:
         if _PLUGIN_DISCOVERY_RESULT is not None and signature == _PLUGIN_DISCOVERY_SIGNATURE:
             return _PLUGIN_DISCOVERY_RESULT
@@ -397,6 +429,33 @@ def _worker_main(connection: Any, plugin_path: str, site_id: str, base_url: str)
                 (data["tid"], str(data["page"]), False),
                 (data["tid"], str(data["page"])),
             ])
+        if operation == "category_batch":
+            # 各个分类是独立请求，可以并发；插件在 categoryContent 里写 self.* 时退回顺序执行
+            items = list(data.get("items") or [])
+            workers = 1 if data.get("serial") else max(1, min(int(data.get("workers") or 4), len(items) or 1))
+
+            def one(item: dict[str, Any]) -> dict[str, Any]:
+                try:
+                    return {
+                        "tid": item.get("tid"),
+                        "ok": True,
+                        "result": dispatch_with_warmup("category", dict(item)),
+                    }
+                except Exception as exc:
+                    return {"tid": item.get("tid"), "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+            batch_started = time.perf_counter()
+            if workers <= 1 or len(items) <= 1:
+                results, used = [one(item) for item in items], 1
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    results, used = list(pool.map(one, items)), workers
+            # 这里的耗时不含 worker 冷启动，父进程用它判断并发是否划算
+            return {
+                "results": results,
+                "workers": used,
+                "elapsed_ms": round((time.perf_counter() - batch_started) * 1000),
+            }
         if operation == "search":
             return _invoke(instance, "searchContent", [
                 (data["keyword"], False, str(data["page"])),
@@ -423,6 +482,29 @@ def _worker_main(connection: Any, plugin_path: str, site_id: str, base_url: str)
                 return _invoke(instance, "localProxy", [(query,)])
         raise PluginError("未知插件操作")
 
+    warmup_lock = threading.Lock()
+
+    def dispatch_with_warmup(operation: str, data: dict[str, Any]) -> Any:
+        """有些插件把状态建在 homeContent 里（如优酷的 self.typeid），
+        首页命中缓存或 worker 重启后直接翻分类就会缺状态，这里补跑一次首页再重试。"""
+        try:
+            return dispatch(operation, data)
+        except (AttributeError, KeyError) as exc:
+            if operation not in {"category", "search", "detail", "player"}:
+                raise
+            with warmup_lock:
+                warmed_before = home_invoked
+                if not warmed_before:
+                    print(
+                        f"[{site_id}] {operation} 缺少首页状态（{type(exc).__name__}: {exc}），"
+                        f"补跑 homeContent 后重试",
+                        flush=True,
+                    )
+                    dispatch("home", {})
+            if warmed_before:
+                raise
+            return dispatch(operation, data)
+
     while True:
         try:
             message = connection.recv()
@@ -430,16 +512,7 @@ def _worker_main(connection: Any, plugin_path: str, site_id: str, base_url: str)
             data = message.get("data", {})
             if operation == "stop":
                 break
-            try:
-                result = dispatch(operation, data)
-            except (AttributeError, KeyError) as exc:
-                # 有些插件把状态建在 homeContent 里（如优酷的 self.typeid），
-                # 首页命中缓存或 worker 重启后直接翻分类就会缺状态，这里补跑一次首页再重试
-                if home_invoked or operation not in {"category", "search", "detail", "player"}:
-                    raise
-                print(f"[{site_id}] {operation} 缺少首页状态（{type(exc).__name__}: {exc}），补跑 homeContent 后重试", flush=True)
-                dispatch("home", {})
-                result = dispatch(operation, data)
+            result = dispatch_with_warmup(operation, data)
             connection.send({"ok": True, "result": result})
         except EOFError:
             break
@@ -466,6 +539,8 @@ class PluginRuntime:
         self.process: Any = None
         self.connection: Any = None
         self.lock = threading.Lock()
+        self._counter_lock = threading.Lock()
+        self.foreground_waiting = 0
 
     def _start(self) -> None:
         context = mp.get_context("spawn")
@@ -490,7 +565,30 @@ class PluginRuntime:
         self.process = process
         self.connection = parent
 
-    def call(self, operation: str, data: dict[str, Any]) -> Any:
+    def call(
+        self,
+        operation: str,
+        data: dict[str, Any],
+        background: bool = False,
+        timeout: int | None = None,
+    ) -> Any:
+        # 同站点只有一个 worker、一条管道，调用天然排队；
+        # 后台预取必须给前台请求让行，否则用户点一下要等预取排完。
+        if background:
+            deadline = time.monotonic() + BACKGROUND_YIELD_TIMEOUT
+            while self.foreground_waiting > 0 and time.monotonic() < deadline:
+                time.sleep(0.2)
+        else:
+            with self._counter_lock:
+                self.foreground_waiting += 1
+        try:
+            return self._call_locked(operation, data, timeout or CALL_TIMEOUT)
+        finally:
+            if not background:
+                with self._counter_lock:
+                    self.foreground_waiting -= 1
+
+    def _call_locked(self, operation: str, data: dict[str, Any], timeout: int) -> Any:
         with self.lock:
             if self.path.stat().st_mtime_ns != self.modified:
                 self.close()
@@ -499,9 +597,9 @@ class PluginRuntime:
                 self.close()
                 self._start()
             self.connection.send({"operation": operation, "data": data})
-            if not self.connection.poll(CALL_TIMEOUT):
+            if not self.connection.poll(timeout):
                 self.close()
-                raise PluginTimeout(f"{operation} 调用超过 {CALL_TIMEOUT} 秒")
+                raise PluginTimeout(f"{operation} 调用超过 {timeout} 秒")
             response = self.connection.recv()
             if not response.get("ok"):
                 raise PluginError(response.get("error") or "插件调用失败")
@@ -539,11 +637,112 @@ def get_runtime(site_id: str) -> PluginRuntime:
         return runtime
 
 
-def get_cached_plugin_result(site: str, operation: str, data: dict[str, Any], ttl: int) -> Any:
-    path = _safe_plugin_path(site)
-    signature = path.stat().st_mtime_ns
+def _results_dir() -> Path:
+    return CACHE_DIR / "results"
+
+
+def _disk_result_path(key: tuple[str, int, str, str]) -> Path:
+    digest = hashlib.sha256("\x1f".join(str(part) for part in key).encode("utf-8")).hexdigest()[:40]
+    return _results_dir() / f"{digest}.json"
+
+
+def read_disk_result(key: tuple[str, int, str, str]) -> tuple[bool, Any]:
+    path = _disk_result_path(key)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False, None
+    if not isinstance(payload, dict) or float(payload.get("expires") or 0) <= time.time():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return False, None
+    return True, payload.get("result")
+
+
+def write_disk_result(key: tuple[str, int, str, str], result: Any, ttl: int) -> None:
+    path = _disk_result_path(key)
+    payload = {
+        "site": key[0],
+        "operation": key[2],
+        "data": key[3],
+        "expires": time.time() + ttl,
+        "result": result,
+    }
+    temporary = path.with_suffix(f".{secrets.token_hex(6)}.tmp")
+    try:
+        _results_dir().mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
+        os.replace(temporary, path)
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"[cache] 写盘失败 {key[2]} {key[0]}：{type(exc).__name__}: {exc}", flush=True)
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+
+
+def prune_disk_results() -> None:
+    """启动时清掉过期条目，并给总量设个上限。"""
+    directory = _results_dir()
+    if not directory.is_dir():
+        return
+    now = time.time()
+    entries: list[tuple[float, Path]] = []
+    removed = 0
+    for path in directory.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            expires = float(payload.get("expires") or 0)
+        except (OSError, TypeError, ValueError):
+            expires = 0
+        if expires <= now:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+            continue
+        entries.append((expires, path))
+    for path in directory.glob("*.tmp"):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    if len(entries) > DISK_RESULT_CACHE_LIMIT:
+        entries.sort()
+        for _expires, path in entries[: len(entries) - DISK_RESULT_CACHE_LIMIT]:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    if removed or entries:
+        print(f"[cache] 磁盘结果缓存 {len(entries)} 条可用，清理 {removed} 条", flush=True)
+
+
+def _result_cache_key(site: str, operation: str, data: dict[str, Any]) -> tuple[str, int, str, str]:
+    signature = _safe_plugin_path(site).stat().st_mtime_ns
     data_key = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    key = (site, signature, operation, data_key)
+    return (site, signature, operation, data_key)
+
+
+def store_plugin_result(site: str, operation: str, data: dict[str, Any], ttl: int, result: Any) -> None:
+    """把已经拿到的结果塞进内存 + 磁盘缓存（批量预取用）。"""
+    key = _result_cache_key(site, operation, data)
+    if operation in DISK_CACHEABLE_OPERATIONS:
+        write_disk_result(key, result, DISK_RESULT_CACHE_TTL)
+    with _RESULT_CACHE_LOCK:
+        while len(_RESULT_CACHE) >= _RESULT_CACHE_LIMIT:
+            _RESULT_CACHE.pop(next(iter(_RESULT_CACHE)))
+        _RESULT_CACHE[key] = (time.monotonic() + ttl, result)
+
+
+def get_cached_plugin_result(
+    site: str, operation: str, data: dict[str, Any], ttl: int, background: bool = False
+) -> Any:
+    key = _result_cache_key(site, operation, data)
     now = time.monotonic()
     with _RESULT_CACHE_LOCK:
         cached = _RESULT_CACHE.get(key)
@@ -553,8 +752,19 @@ def get_cached_plugin_result(site: str, operation: str, data: dict[str, Any], tt
         if cached is not None:
             _RESULT_CACHE.pop(key, None)
 
+    # 后台预取过的首页/分类落盘保存，重启或内存过期后点进来也不用再跑插件
+    if operation in DISK_CACHEABLE_OPERATIONS:
+        found, stored = read_disk_result(key)
+        if found:
+            with _RESULT_CACHE_LOCK:
+                _RESULT_CACHE[key] = (time.monotonic() + ttl, stored)
+            print(f"[cache] disk hit {operation} {site}", flush=True)
+            return stored
+
     started = time.perf_counter()
-    result = get_runtime(site).call(operation, data)
+    result = get_runtime(site).call(operation, data, background=background)
+    if operation in DISK_CACHEABLE_OPERATIONS:
+        write_disk_result(key, result, DISK_RESULT_CACHE_TTL)
     with _RESULT_CACHE_LOCK:
         expired = [cache_key for cache_key, (expires, _) in _RESULT_CACHE.items() if expires <= now]
         for cache_key in expired:
@@ -566,7 +776,237 @@ def get_cached_plugin_result(site: str, operation: str, data: dict[str, Any], tt
     return result
 
 
+_SOURCE_STATS: dict[str, dict[str, Any]] = {}
+_SOURCE_STATS_LOCK = threading.Lock()
+_SOURCE_STATS_DIRTY = False
+_PREFETCH_INFLIGHT: set[str] = set()
+_PREFETCH_INFLIGHT_LOCK = threading.Lock()
+_PREFETCH_POOL: ThreadPoolExecutor | None = None
+_PREFETCH_POOL_LOCK = threading.Lock()
+
+
+def _source_stats_path() -> Path:
+    return CACHE_DIR / "source-stats.json"
+
+
+def load_source_stats() -> dict[str, dict[str, Any]]:
+    with _SOURCE_STATS_LOCK:
+        if _SOURCE_STATS:
+            return dict(_SOURCE_STATS)
+        try:
+            payload = json.loads(_source_stats_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = {}
+        if isinstance(payload, dict):
+            for site, stat in payload.items():
+                if isinstance(stat, dict):
+                    _SOURCE_STATS[str(site)] = stat
+        return dict(_SOURCE_STATS)
+
+
+def _store_source_stat(site: str, stat: dict[str, Any]) -> None:
+    global _SOURCE_STATS_DIRTY
+    with _SOURCE_STATS_LOCK:
+        _SOURCE_STATS[site] = stat
+        _SOURCE_STATS_DIRTY = True
+
+
+def flush_source_stats() -> None:
+    global _SOURCE_STATS_DIRTY
+    with _SOURCE_STATS_LOCK:
+        if not _SOURCE_STATS_DIRTY:
+            return
+        payload = json.dumps(_SOURCE_STATS, ensure_ascii=False)
+        _SOURCE_STATS_DIRTY = False
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _source_stats_path().write_text(payload, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _prefetch_pool() -> ThreadPoolExecutor:
+    global _PREFETCH_POOL
+    with _PREFETCH_POOL_LOCK:
+        if _PREFETCH_POOL is None:
+            _PREFETCH_POOL = ThreadPoolExecutor(
+                max_workers=PREFETCH_WORKERS, thread_name_prefix="hkl-prefetch"
+            )
+        return _PREFETCH_POOL
+
+
+def _runtime_is_live(site: str) -> bool:
+    with _RUNTIMES_LOCK:
+        runtime = _RUNTIMES.get(site)
+    return bool(runtime and runtime.process is not None and runtime.process.is_alive())
+
+
+def _release_runtime(site: str) -> None:
+    """预取完成后关掉临时起的 worker，避免几十个进程常驻。"""
+    with _RUNTIMES_LOCK:
+        runtime = _RUNTIMES.pop(site, None)
+    if runtime is not None:
+        runtime.close()
+
+
+def prefetch_source_stat(site: str) -> None:
+    """静默加载一个数据源的首页 + 第一个分类，记下项目数。"""
+    was_live = _runtime_is_live(site)
+    started = time.perf_counter()
+    stat: dict[str, Any] = {"state": "failed", "items": 0, "categories": 0, "category": "", "error": ""}
+    try:
+        home = normalize_home(get_cached_plugin_result(site, "home", {}, HOME_CACHE_TTL, background=True))
+        categories = home["categories"]
+        stat["categories"] = len(categories)
+        stat["items"] = len(home["items"])
+        if categories:
+            first = categories[0]
+            stat["category"] = str(first.get("type_name") or "")
+            category_started = time.perf_counter()
+            listing = get_cached_plugin_result(
+                site,
+                "category",
+                {"tid": str(first.get("type_id")), "page": 1, "extend": {}},
+                CATEGORY_CACHE_TTL,
+                background=True,
+            )
+            # 记下单个分类的串行耗时，用于判断多线程抓其余分类是否划算
+            stat["category_ms"] = round((time.perf_counter() - category_started) * 1000)
+            stat["items"] = len(normalize_listing(listing, 1)["items"])
+        stat["state"] = "ok"
+    except Exception as exc:
+        stat["error"] = f"{type(exc).__name__}: {exc}"[:200]
+    finally:
+        stat["updated"] = time.time()
+        stat["cost_ms"] = round((time.perf_counter() - started) * 1000)
+        _store_source_stat(site, stat)
+        flush_source_stats()
+        if not was_live:
+            _release_runtime(site)
+        with _PREFETCH_INFLIGHT_LOCK:
+            _PREFETCH_INFLIGHT.discard(site)
+    print(
+        f"[prefetch] {site} {stat['state']} items={stat['items']} "
+        f"categories={stat['categories']} {stat['cost_ms']}ms"
+        + (f" {stat['error']}" if stat["error"] else ""),
+        flush=True,
+    )
+
+
+def schedule_source_stats(sites: list[str], batch: int = PREFETCH_SITE_BATCH) -> int:
+    """给还没有统计结果的数据源排队预取，每次最多 batch 个，跨站点并行。"""
+    known = load_source_stats()
+    now = time.time()
+    scheduled = 0
+    with _PREFETCH_INFLIGHT_LOCK:
+        # 队列不堆太长，这样用户刚选中的数据源能很快排到
+        room = max(0, PREFETCH_WORKERS * 3 - len(_PREFETCH_INFLIGHT))
+    batch = min(batch, room)
+    for site in sites:
+        if scheduled >= batch:
+            break
+        stat = known.get(site)
+        if stat and stat.get("state") == "ok" and now - float(stat.get("updated") or 0) < SOURCE_STATS_TTL:
+            continue
+        if stat and stat.get("state") == "failed" and now - float(stat.get("updated") or 0) < 600:
+            continue
+        with _PREFETCH_INFLIGHT_LOCK:
+            if site in _PREFETCH_INFLIGHT:
+                continue
+            try:
+                _safe_plugin_path(site)
+            except PluginError:
+                continue
+            _PREFETCH_INFLIGHT.add(site)
+        _prefetch_pool().submit(prefetch_source_stat, site)
+        scheduled += 1
+    return scheduled
+
+
+def _plugin_is_stateful(site: str, method: str) -> bool:
+    for plugin in discover_plugins():
+        if plugin["id"] == site:
+            return method in (plugin.get("stateful") or [])
+    return True
+
+
+def _prefetch_categories_now(site: str, categories: list[dict[str, Any]]) -> None:
+    """一次 category_batch 调用，让 worker 内部并发抓多个分类。"""
+    items = [{"tid": str(c.get("type_id")), "page": 1, "extend": {}} for c in categories]
+    pending = [item for item in items if not _has_cached_category(site, item)]
+    if not pending:
+        print(f"[prefetch-tabs] {site} 全部已缓存，跳过", flush=True)
+        return
+    stat = load_source_stats().get(site) or {}
+    # 分类之间互不依赖，默认并发；插件在 categoryContent 里写 self.* 时退回顺序，
+    # 也支持在 source-stats.json 里给某个源手工写 "tab_mode": "serial" 强制顺序。
+    stateful = _plugin_is_stateful(site, "categoryContent")
+    serial = stateful or stat.get("tab_mode") == "serial"
+    was_live = _runtime_is_live(site)
+    started = time.perf_counter()
+    try:
+        payload = get_runtime(site).call(
+            "category_batch",
+            {"items": pending, "workers": PREFETCH_TAB_WORKERS, "serial": serial},
+            background=True,
+            timeout=BATCH_CALL_TIMEOUT,
+        )
+    except (PluginError, EOFError, BrokenPipeError, OSError) as exc:
+        print(f"[prefetch-tabs] {site} 批量失败：{type(exc).__name__}: {exc}", flush=True)
+        return
+    finally:
+        if not was_live:
+            _release_runtime(site)
+    ok = 0
+    for item, entry in zip(pending, (payload or {}).get("results") or []):
+        if entry.get("ok"):
+            store_plugin_result(site, "category", item, CATEGORY_CACHE_TTL, entry.get("result"))
+            ok += 1
+        else:
+            print(f"[prefetch-tabs] {site} {item['tid']} 失败：{entry.get('error')}", flush=True)
+    cost_ms = round((time.perf_counter() - started) * 1000)
+    # 判断并发是否划算时用 worker 内部耗时，避免把冷启动算进去
+    work_ms = int((payload or {}).get("elapsed_ms") or cost_ms)
+    baseline = float(stat.get("category_ms") or 0)
+    print(
+        f"[prefetch-tabs] {site} {ok}/{len(pending)} 个分类完成，"
+        f"{'顺序' if serial else str((payload or {}).get('workers')) + ' 线程'}，"
+        f"抓取 {work_ms}ms / 总 {cost_ms}ms（单个分类串行耗时 {round(baseline)}ms）",
+        flush=True,
+    )
+
+
+def _has_cached_category(site: str, item: dict[str, Any]) -> bool:
+    key = _result_cache_key(site, "category", item)
+    with _RESULT_CACHE_LOCK:
+        cached = _RESULT_CACHE.get(key)
+    if cached is not None and cached[0] > time.monotonic():
+        return True
+    found, _stored = read_disk_result(key)
+    return found
+
+
+def prefetch_site_categories(site: str, limit: int = PREFETCH_CATEGORY_LIMIT) -> int:
+    """点进某个数据源后，后台把其余分类的第一页预热进缓存。"""
+    try:
+        home = normalize_home(get_cached_plugin_result(site, "home", {}, HOME_CACHE_TTL, background=True))
+    except Exception as exc:
+        print(f"[prefetch-tabs] {site} 首页失败：{type(exc).__name__}: {exc}", flush=True)
+        return 0
+    categories = home["categories"][1:limit + 1]
+    if not categories:
+        return 0
+    _prefetch_pool().submit(_prefetch_categories_now, site, categories)
+    return len(categories)
+
+
 def close_runtimes() -> None:
+    global _PREFETCH_POOL
+    with _PREFETCH_POOL_LOCK:
+        pool, _PREFETCH_POOL = _PREFETCH_POOL, None
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
+    flush_source_stats()
     with _RUNTIMES_LOCK:
         for runtime in _RUNTIMES.values():
             runtime.close()
@@ -1441,6 +1881,8 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/player": self.api_player,
             "/api/media-proxy": self.api_media_proxy,
             "/api/local-proxy": self.api_local_proxy,
+            "/api/source-stats": self.api_source_stats,
+            "/api/prefetch-tabs": self.api_prefetch_tabs,
         }
         route = routes.get(parsed.path)
         if route:
@@ -1535,6 +1977,41 @@ class Handler(SimpleHTTPRequestHandler):
         except (EOFError, BrokenPipeError, OSError) as exc:
             self.send_json(502, {"error": f"插件 worker 异常：{exc}"})
         return None
+
+    def api_source_stats(self, params: dict[str, list[str]]) -> None:
+        """返回各数据源第一个分类的项目数；顺带给还没统计过的排队预取。"""
+        requested = [
+            site.strip()
+            for value in params.get("sites", [])
+            for site in str(value).split(",")
+            if site.strip()
+        ]
+        scheduled = schedule_source_stats(requested) if requested else 0
+        stats = load_source_stats()
+        with _PREFETCH_INFLIGHT_LOCK:
+            pending = len(_PREFETCH_INFLIGHT)
+        payload = {
+            site: {
+                "items": stat.get("items", 0),
+                "categories": stat.get("categories", 0),
+                "category": stat.get("category", ""),
+                "state": stat.get("state", ""),
+            }
+            for site, stat in stats.items()
+        }
+        remaining = sum(1 for site in requested if site not in stats)
+        self.send_json(200, {
+            "stats": payload,
+            "pending": pending,
+            "scheduled": scheduled,
+            "remaining": remaining,
+        })
+
+    def api_prefetch_tabs(self, params: dict[str, list[str]]) -> None:
+        site = self.require_site(params)
+        if site is None:
+            return
+        self.send_json(200, {"started": prefetch_site_categories(site)})
 
     def api_plugins(self, _params: dict[str, list[str]]) -> None:
         featured = load_featured_sites()
@@ -2000,6 +2477,7 @@ class Handler(SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     mp.freeze_support()
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    prune_disk_results()
     handler = partial(Handler, directory=str(WEB_DIR))
     address = (HOST, PORT)
     print(f"HKL 本地网页：http://{HOST}:{PORT}")
