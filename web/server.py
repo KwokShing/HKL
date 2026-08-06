@@ -16,6 +16,7 @@ import threading
 import time
 import traceback
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from html import unescape
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -781,6 +782,46 @@ def resolve_page_media(url: str, headers: dict[str, Any], depth: int = 0) -> str
     return resolved
 
 
+_MEDIA_KIND_CACHE: dict[str, tuple[float, str]] = {}
+_MEDIA_KIND_CACHE_LOCK = threading.Lock()
+MEDIA_KIND_CACHE_TTL = 300
+
+
+def probe_media_kind(url: str, headers: dict[str, Any]) -> str:
+    """地址看不出扩展名时，取开头一小段判断是 HLS 还是 DASH。"""
+    if not url.startswith(("http://", "https://")):
+        return ""
+    with _MEDIA_KIND_CACHE_LOCK:
+        cached = _MEDIA_KIND_CACHE.get(url)
+        if cached and time.time() - cached[0] < MEDIA_KIND_CACHE_TTL:
+            return cached[1]
+    kind = ""
+    try:
+        request_headers = {"User-Agent": BROWSER_UA}
+        for name, value in (headers or {}).items():
+            text = str(value)
+            if "\r" not in text and "\n" not in text:
+                request_headers[str(name)] = text
+        request_headers["Range"] = "bytes=0-2047"
+        response = requests.get(url, headers=request_headers, timeout=(10, 20), verify=False, allow_redirects=True)
+        if response.status_code in {200, 206}:
+            content_type = str(response.headers.get("Content-Type", "")).lower()
+            head = response.content[:2048].lstrip(b"\xef\xbb\xbf \t\r\n")
+            if head.startswith(b"#EXTM3U") or "mpegurl" in content_type:
+                kind = "hls"
+            elif b"<MPD" in head or "dash+xml" in content_type:
+                kind = "dash"
+    except requests.RequestException:
+        kind = ""
+    with _MEDIA_KIND_CACHE_LOCK:
+        if len(_MEDIA_KIND_CACHE) >= 1024:
+            _MEDIA_KIND_CACHE.clear()
+        _MEDIA_KIND_CACHE[url] = (time.time(), kind)
+    if kind:
+        print(f"[media-kind] {url[:160]} -> {kind}", flush=True)
+    return kind
+
+
 def normalize_player(result: Any) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise PluginError("playerContent 没有返回字典")
@@ -809,8 +850,12 @@ def normalize_player(result: Any) -> dict[str, Any]:
             "headers": {},
         }
     source_url = ""
+    media_kind = ""
     looks_like_web_page = bool(re.search(r"\.(?:html?|shtml|php|asp|aspx|jsp)(?:$|[?&#])", url, re.I))
-    if not is_direct_media_url(url) and (requires_parse or looks_like_web_page):
+    if not is_direct_media_url(url):
+        # 地址不带媒体扩展名时先探测内容，很多站点用 play.php 之类直接吐 m3u8
+        media_kind = probe_media_kind(url, headers)
+    if not media_kind and not is_direct_media_url(url) and (requires_parse or looks_like_web_page):
         resolved = resolve_page_media(url, headers)
         if resolved:
             source_url = url
@@ -821,8 +866,8 @@ def normalize_player(result: Any) -> dict[str, Any]:
     player = {
         "url": url,
         "mode": "media",
-        "is_hls": is_hls_url(url),
-        "is_dash": is_dash_url(url),
+        "is_hls": is_hls_url(url) or media_kind == "hls",
+        "is_dash": is_dash_url(url) or media_kind == "dash",
         "options": options,
         "headers": headers,
     }
@@ -941,6 +986,188 @@ def _is_own_proxy_url(value: str) -> bool:
     except ValueError:
         return False
     return parts.hostname in {HOST, "localhost", "127.0.0.1"} and parts.path.startswith("/api/")
+
+
+PTS_PROBE_BYTES = 48 * 1024
+PTS_WRAP_SECONDS = (1 << 33) / 90000
+DISCONTINUITY_PROBE_LIMIT = 12
+PTS_CACHE_TTL = 600
+SANITIZED_MANIFEST_CACHE_TTL = 300
+_PTS_CACHE: dict[str, tuple[float, float | None]] = {}
+_PTS_CACHE_LOCK = threading.Lock()
+_SANITIZED_MANIFEST_CACHE: dict[str, tuple[float, str]] = {}
+_SANITIZED_MANIFEST_CACHE_LOCK = threading.Lock()
+
+
+def first_transport_stream_pts(data: bytes) -> float | None:
+    """读取 MPEG-TS 里第一个视频/音频 PES 的 PTS（秒）。"""
+    limit = len(data) - 188
+    offset = data.find(b"\x47")
+    if offset < 0:
+        return None
+    while 0 <= offset <= limit:
+        if data[offset] != 0x47:
+            offset = data.find(b"\x47", offset + 1)
+            continue
+        payload_start = bool(data[offset + 1] & 0x40)
+        adaptation = (data[offset + 3] >> 4) & 0x3
+        position = offset + 4
+        if adaptation in (2, 3):
+            position += 1 + data[offset + 4]
+        if payload_start and position + 14 <= offset + 188 and data[position:position + 3] == b"\x00\x00\x01":
+            stream_id = data[position + 3]
+            if (0xE0 <= stream_id <= 0xEF or 0xC0 <= stream_id <= 0xDF) and data[position + 7] & 0x80:
+                marker = data[position + 9:position + 14]
+                pts = (
+                    ((marker[0] >> 1) & 0x07) << 30
+                    | marker[1] << 22
+                    | ((marker[2] >> 1) & 0x7F) << 15
+                    | marker[3] << 7
+                    | (marker[4] >> 1)
+                )
+                return pts / 90000
+        offset += 188
+    return None
+
+
+def probe_segment_pts(url: str, headers: dict[str, str]) -> float | None:
+    """只下载分片开头一小段来取首个 PTS，用于核验时间轴是否真的断开。"""
+    with _PTS_CACHE_LOCK:
+        cached = _PTS_CACHE.get(url)
+        if cached and time.time() - cached[0] < PTS_CACHE_TTL:
+            return cached[1]
+    pts: float | None = None
+    try:
+        response = requests.get(
+            url,
+            headers={**headers, "Range": f"bytes=0-{PTS_PROBE_BYTES - 1}"},
+            timeout=(10, 20),
+            verify=False,
+            allow_redirects=True,
+        )
+        if response.status_code in {200, 206}:
+            pts = first_transport_stream_pts(response.content)
+    except requests.RequestException:
+        pts = None
+    with _PTS_CACHE_LOCK:
+        if len(_PTS_CACHE) >= 4096:
+            _PTS_CACHE.clear()
+        _PTS_CACHE[url] = (time.time(), pts)
+    return pts
+
+
+def _split_hls_manifest(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """把清单拆成「标签 + 分片地址」序列，尾部标签单独返回；顺序完全保留。"""
+    segments: list[dict[str, Any]] = []
+    pending: list[str] = []
+    for raw in text.replace("\r", "").split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            pending.append(line)
+            continue
+        segments.append({"tags": pending, "uri": line})
+        pending = []
+    return segments, pending
+
+
+def _segment_duration(tags: list[str]) -> float:
+    for tag in tags:
+        match = re.match(r"#EXTINF:\s*([\d.]+)", tag)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                return 0.0
+    return 0.0
+
+
+def _is_discontinuity_tag(tag: str) -> bool:
+    return tag.startswith("#EXT-X-DISCONTINUITY") and not tag.startswith("#EXT-X-DISCONTINUITY-SEQUENCE")
+
+
+def sanitize_hls_discontinuities(text: str, base_url: str, headers: dict[str, str]) -> str:
+    """删除被证伪的 #EXT-X-DISCONTINUITY。
+
+    有些站点会在时间轴其实连续的清单里插入 DISCONTINUITY，hls.js 会据此重设
+    timestampOffset，拖动进度时就会出现 CHUNK_DEMUXER_ERROR_APPEND_FAILED
+    （Parsed buffer not in DTS sequence）。这里只丢弃能证明多余的标记：
+    首个分片之前的标记、重复标记，以及探测相邻分片 PTS 后确认时间轴连续的标记。
+    """
+    if not _is_discontinuity_tag_present(text) or "#EXT-X-MAP" in text:
+        return text
+    cache_key = hashlib.sha256(f"{base_url}\n{text}".encode("utf-8")).hexdigest()
+    with _SANITIZED_MANIFEST_CACHE_LOCK:
+        cached = _SANITIZED_MANIFEST_CACHE.get(cache_key)
+        if cached and time.time() - cached[0] < SANITIZED_MANIFEST_CACHE_TTL:
+            return cached[1]
+
+    segments, tail = _split_hls_manifest(text)
+    marked = [index for index, segment in enumerate(segments) if any(_is_discontinuity_tag(tag) for tag in segment["tags"])]
+    if not segments or not marked:
+        return text
+
+    # 首片之前的 DISCONTINUITY 没有可对比的前序分片，VOD 清单里必然多余
+    starts_at_zero = not re.search(r"#EXT-X-MEDIA-SEQUENCE:\s*([1-9]\d*)", text)
+    drop = {0} if (marked and marked[0] == 0 and starts_at_zero) else set()
+
+    candidates = [index for index in marked if index > 0][:DISCONTINUITY_PROBE_LIMIT]
+    if candidates:
+        wanted = sorted({index for candidate in candidates for index in (candidate - 1, candidate)})
+        probes: dict[int, float | None] = {}
+        with ThreadPoolExecutor(max_workers=min(6, len(wanted))) as pool:
+            futures = {
+                pool.submit(probe_segment_pts, urljoin(base_url, segments[index]["uri"]), headers): index
+                for index in wanted
+            }
+            for future in as_completed(futures):
+                probes[futures[future]] = future.result()
+        for candidate in candidates:
+            previous, current = probes.get(candidate - 1), probes.get(candidate)
+            if previous is None or current is None:
+                continue
+            delta = current - previous
+            if delta < -1:
+                delta += PTS_WRAP_SECONDS
+            expected = _segment_duration(segments[candidate - 1]["tags"])
+            if expected <= 0:
+                continue
+            if abs(delta - expected) <= max(0.5, expected * 0.25):
+                drop.add(candidate)
+
+    output: list[str] = []
+    removed = 0
+    for index, segment in enumerate(segments):
+        seen_discontinuity = False
+        for tag in segment["tags"]:
+            if _is_discontinuity_tag(tag):
+                # 被证伪的标记直接删除，重复标记只保留一个
+                if index in drop or seen_discontinuity:
+                    removed += 1
+                    continue
+                seen_discontinuity = True
+            output.append(tag)
+        output.append(segment["uri"])
+    output.extend(tail)
+    result = "\n".join(output) + "\n" if removed else text
+    if removed:
+        print("[hls-sanitize] " + json.dumps({
+            "url": base_url[:200],
+            "segments": len(segments),
+            "marked": len(marked),
+            "removed": removed,
+            "verified": sorted(drop),
+        }, ensure_ascii=False), flush=True)
+    with _SANITIZED_MANIFEST_CACHE_LOCK:
+        if len(_SANITIZED_MANIFEST_CACHE) >= 256:
+            _SANITIZED_MANIFEST_CACHE.clear()
+        _SANITIZED_MANIFEST_CACHE[cache_key] = (time.time(), result)
+    return result
+
+
+def _is_discontinuity_tag_present(text: str) -> bool:
+    return any(_is_discontinuity_tag(line.strip()) for line in text.splitlines() if line.startswith("#EXT-X-DIS"))
 
 
 def _relative_own_proxy_url(value: str) -> str:
@@ -1448,6 +1675,7 @@ class Handler(SimpleHTTPRequestHandler):
             else:
                 manifest_text = decode_media_manifest(body)
                 if manifest_text is not None:
+                    manifest_text = sanitize_hls_discontinuities(manifest_text, response.url, headers)
                     manifest = rewrite_media_manifest(manifest_text, response.url, headers)
                     body = manifest.encode("utf-8")
                     status = 200
@@ -1568,6 +1796,7 @@ class Handler(SimpleHTTPRequestHandler):
                 failure = failure or f"原始清单抓取失败：{exc}"
 
         if manifest_text is not None:
+            manifest_text = sanitize_hls_discontinuities(manifest_text, target_url, upstream_headers)
             body = rewrite_media_manifest(manifest_text, target_url, upstream_headers).encode("utf-8")
             content_type = "application/vnd.apple.mpegurl; charset=utf-8"
             print("[local-proxy] " + json.dumps({
