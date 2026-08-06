@@ -523,14 +523,9 @@
     // 静默轮询：服务端跨数据源并行预取「首页 + 第一个分类」，把项目数写回下拉
     async function pollSourceStats(round = 0) {
       if (round >= SOURCE_STATS_MAX_ROUNDS) return;
-      const order = [
-        state.site,
-        ...state.plugins.filter((plugin) => plugin.featured_rank >= 0)
-          .sort((a, b) => a.featured_rank - b.featured_rank).map((plugin) => plugin.id),
-        ...state.plugins.map((plugin) => plugin.id),
-      ].filter((id, index, list) => id && list.indexOf(id) === index);
       try {
-        const params = new URLSearchParams({ sites: order.join(",") });
+        // 候选集交给服务端决定（当前源优先 + 精选源），避免把上百个 id 塞进 URL
+        const params = new URLSearchParams({ site: state.site });
         const result = await fetchJson(`/api/source-stats?${params}`);
         state.sourceStats = result?.stats || {};
         // 下拉展开时重建 option 会把它关掉，等用户离开焦点再刷新

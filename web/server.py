@@ -893,6 +893,22 @@ def prefetch_source_stat(site: str) -> None:
     )
 
 
+def prefetch_candidates(active: str = "", scope: str = "featured") -> list[str]:
+    """预取候选顺序：当前选中的源 → 配置里的精选源 → （scope=all 时）其余插件。"""
+    available = {plugin["id"] for plugin in discover_plugins()}
+    order: list[str] = []
+    if active in available:
+        order.append(active)
+    for site, _rank in sorted(load_featured_sites().items(), key=lambda item: item[1]):
+        if site in available and site not in order:
+            order.append(site)
+    if scope == "all":
+        for plugin in discover_plugins():
+            if plugin["id"] not in order:
+                order.append(plugin["id"])
+    return order
+
+
 def schedule_source_stats(sites: list[str], batch: int = PREFETCH_SITE_BATCH) -> int:
     """给还没有统计结果的数据源排队预取，每次最多 batch 个，跨站点并行。"""
     known = load_source_stats()
@@ -1979,14 +1995,15 @@ class Handler(SimpleHTTPRequestHandler):
         return None
 
     def api_source_stats(self, params: dict[str, list[str]]) -> None:
-        """返回各数据源第一个分类的项目数；顺带给还没统计过的排队预取。"""
-        requested = [
-            site.strip()
-            for value in params.get("sites", [])
-            for site in str(value).split(",")
-            if site.strip()
-        ]
-        scheduled = schedule_source_stats(requested) if requested else 0
+        """返回各数据源第一个分类的项目数；顺带给还没统计过的排队预取。
+
+        候选集由服务端决定：当前选中的源优先，其次是 ok海豚665 里的精选源；
+        scope=all 时才把其余插件也纳入（195 个源都要起一次 worker，默认不做）。
+        """
+        requested = prefetch_candidates(
+            self.first(params, "site"), self.first(params, "scope") or "featured"
+        )
+        scheduled = schedule_source_stats(requested)
         stats = load_source_stats()
         with _PREFETCH_INFLIGHT_LOCK:
             pending = len(_PREFETCH_INFLIGHT)
