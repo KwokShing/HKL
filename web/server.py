@@ -141,35 +141,38 @@ def _scan_plugins() -> list[dict[str, Any]]:
 
 
 FEATURED_SOURCE_FILE = REPO_ROOT / "ok海豚665"
-_FEATURED_LOCK = threading.Lock()
-_FEATURED_SIGNATURE: tuple[int, int] | None = None
-_FEATURED_ORDER: dict[str, int] = {}
+_DOLPHIN_LOCK = threading.Lock()
+_DOLPHIN_SIGNATURE: tuple[int, int] | None = None
+_DOLPHIN_CONFIG: dict[str, Any] = {"featured": {}, "parsers": []}
 
 
-def load_featured_sites() -> dict[str, int]:
+def load_dolphin_config() -> dict[str, Any]:
     """读取 ok海豚665（TVBox 配置，内容是 JSON 但文件名没有扩展名）。
 
-    取出 sites[].api 指向 py/ 脚本的条目，返回 {插件文件名: 配置里的次序}。
-    按文件 mtime+size 缓存，页面加载时只会真正解析一次。
+    - featured: {插件文件名: sites 里的次序}，只取 api 指向 py/ 脚本的条目
+    - parsers: [{name, url}]，即配置里的 parses 解析接口前缀
+    按 mtime+size 缓存，页面加载时只会真正解析一次。
     """
-    global _FEATURED_SIGNATURE, _FEATURED_ORDER
+    global _DOLPHIN_SIGNATURE, _DOLPHIN_CONFIG
 
     try:
         stat = FEATURED_SOURCE_FILE.stat()
     except OSError:
-        return {}
+        return {"featured": {}, "parsers": []}
     signature = (stat.st_mtime_ns, stat.st_size)
-    with _FEATURED_LOCK:
-        if signature == _FEATURED_SIGNATURE:
-            return _FEATURED_ORDER
-        order: dict[str, int] = {}
+    with _DOLPHIN_LOCK:
+        if signature == _DOLPHIN_SIGNATURE:
+            return _DOLPHIN_CONFIG
         try:
             payload = json.loads(FEATURED_SOURCE_FILE.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError) as exc:
-            print(f"[featured] 解析 {FEATURED_SOURCE_FILE.name} 失败：{exc}", flush=True)
+            print(f"[dolphin] 解析 {FEATURED_SOURCE_FILE.name} 失败：{exc}", flush=True)
             payload = {}
-        sites = payload.get("sites") if isinstance(payload, dict) else None
-        for entry in sites or []:
+        if not isinstance(payload, dict):
+            payload = {}
+
+        featured: dict[str, int] = {}
+        for entry in payload.get("sites") or []:
             if not isinstance(entry, dict):
                 continue
             api = str(entry.get("api") or "")
@@ -177,11 +180,34 @@ def load_featured_sites() -> dict[str, int]:
             # 只认指向 py 脚本的源，js/jar/csp_/接口地址一律跳过
             if not file_name.lower().endswith(".py") or "/" in file_name or "\\" in file_name:
                 continue
-            order.setdefault(file_name, len(order))
-        _FEATURED_SIGNATURE = signature
-        _FEATURED_ORDER = order
-        print(f"[featured] {FEATURED_SOURCE_FILE.name}: {len(order)} 个 py 源", flush=True)
-        return order
+            featured.setdefault(file_name, len(featured))
+
+        parsers: list[dict[str, str]] = []
+        seen_urls = set()
+        for entry in payload.get("parses") or []:
+            if not isinstance(entry, dict):
+                continue
+            url = str(entry.get("url") or "").strip()
+            if not url.startswith("https://") or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            parsers.append({"name": str(entry.get("name") or url), "url": url})
+
+        _DOLPHIN_SIGNATURE = signature
+        _DOLPHIN_CONFIG = {"featured": featured, "parsers": parsers}
+        print(
+            f"[dolphin] {FEATURED_SOURCE_FILE.name}: {len(featured)} 个 py 源, {len(parsers)} 个解析接口",
+            flush=True,
+        )
+        return _DOLPHIN_CONFIG
+
+
+def load_featured_sites() -> dict[str, int]:
+    return load_dolphin_config()["featured"]
+
+
+def load_parsers() -> list[dict[str, str]]:
+    return load_dolphin_config()["parsers"]
 
 
 def _plugin_directory_signature() -> tuple[tuple[str, int, int], ...]:
@@ -901,6 +927,45 @@ def probe_media_kind(url: str, headers: dict[str, Any]) -> str:
     return kind
 
 
+def _parser_prefix_match(url: str) -> str:
+    for parser in load_parsers():
+        if url.startswith(parser["url"]):
+            return parser["url"]
+    return ""
+
+
+def _inner_page_target(url: str) -> str:
+    """从解析页地址里取出被解析的平台页，例如 jx.xxx/?url=<平台页>。"""
+    try:
+        query = parse_qs(urlsplit(url).query)
+    except ValueError:
+        return ""
+    for values in query.values():
+        for value in values:
+            if value.startswith(("http://", "https://")):
+                return value
+    return ""
+
+
+def build_parser_embeds(url: str) -> tuple[str, list[dict[str, str]]]:
+    """把需要外部解析的地址转成解析页列表（交给浏览器 iframe 去跑，等价于 TVBox 的 WebView 嗅探）。
+
+    返回 (被解析的平台页, [{name, url}])。
+    """
+    parsers = load_parsers()
+    if not parsers:
+        return "", []
+    prefix = _parser_prefix_match(url)
+    target = _inner_page_target(url) if prefix else url
+    if not target.startswith(("http://", "https://")):
+        return "", []
+    embeds = [{"name": parser["name"], "url": parser["url"] + target} for parser in parsers]
+    if prefix:
+        # 插件已经指定了解析接口，保持它在第一位
+        embeds.sort(key=lambda item: 0 if item["url"].startswith(prefix) else 1)
+    return target, embeds
+
+
 def normalize_player(result: Any) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise PluginError("playerContent 没有返回字典")
@@ -923,6 +988,7 @@ def normalize_player(result: Any) -> dict[str, Any]:
             "url": embed_url,
             "source_url": url,
             "mode": "embed",
+            "embed_kind": "youku",
             "is_hls": False,
             "is_dash": False,
             "options": options,
@@ -941,7 +1007,22 @@ def normalize_player(result: Any) -> dict[str, Any]:
             headers = {**headers, "Referer": headers.get("Referer") or url}
             url = resolved
         elif requires_parse:
-            raise PluginError("该片源返回的是平台网页，站内解析未找到直链；请选择其他片源")
+            # 站内解析拿不到直链时，退回解析页 iframe（腾讯/爱奇艺这类平台源只能这么播）
+            target, embeds = build_parser_embeds(url)
+            if embeds:
+                print(f"[player-parse] {url[:120]} -> 解析页 {embeds[0]['url'][:120]}", flush=True)
+                return {
+                    "url": embeds[0]["url"],
+                    "source_url": target or url,
+                    "mode": "embed",
+                    "embed_kind": "parser",
+                    "parsers": embeds,
+                    "is_hls": False,
+                    "is_dash": False,
+                    "options": options,
+                    "headers": {},
+                }
+            raise PluginError("该片源需要外部解析，但配置里没有可用的解析接口；请选择其他片源")
     player = {
         "url": url,
         "mode": "media",

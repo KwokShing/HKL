@@ -82,6 +82,8 @@
     @keyframes seek-spin { to { transform: rotate(360deg); } }
     #now-playing { margin: 15px 6px 4px; overflow: hidden; color: #e8e9f2; font-size: 15px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
     #player-status { min-height: 20px; margin: 4px 6px 0; color: var(--muted); font-size: 13px; }
+    #parser-bar { display: flex; gap: 8px; align-items: center; margin: 8px 6px 0; color: var(--muted); font-size: 13px; }
+    #parser-select { max-width: 220px; padding: 5px 8px; color: #e8e9f2; font: inherit; background: rgb(19 22 34 / 90%); border: 1px solid var(--line); border-radius: 8px; }
     .playback-info { min-width: 0; padding: 20px; background: linear-gradient(160deg, rgb(29 33 49 / 94%), rgb(19 22 34 / 90%)); border: 1px solid var(--line); border-radius: 17px; box-shadow: 0 20px 50px rgb(0 0 0 / 24%); backdrop-filter: blur(14px); }
     .summary { display: grid; grid-template-columns: 106px minmax(0, 1fr); gap: 16px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
     .summary > div { min-width: 0; max-height: clamp(170px, 24vh, 240px); padding-right: 8px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
@@ -140,6 +142,10 @@
           </div>
           <h2 id="now-playing" class="section-title">请选择片源和选集开始播放</h2>
           <p id="player-status"></p>
+          <p id="parser-bar" hidden>
+            <label for="parser-select">解析接口</label>
+            <select id="parser-select"></select>
+          </p>
         </section>
         <aside class="playback-info">
           <section class="summary">
@@ -192,6 +198,8 @@
     const playerPanel = element("player-panel");
     const player = element("video-player");
     const embedPlayer = element("embed-player");
+    const parserBar = element("parser-bar");
+    const parserSelect = element("parser-select");
     const seekLoader = element("seek-loader");
     const playerStatus = element("player-status");
     let pointerDownWasPlaying = false;
@@ -267,6 +275,8 @@
       pointerDownWasPlaying = false;
       setSeekLoading(false, true);
       setPlayerLoading(false);
+      renderParsers([], "");
+      embedPlayer.removeAttribute("sandbox");
       embedPlayer.hidden = true;
       embedPlayer.removeAttribute("src");
       player.hidden = false;
@@ -624,6 +634,30 @@
       }
     }
 
+    function renderParsers(parsers, currentUrl) {
+      parserSelect.replaceChildren();
+      if (parsers.length < 2) {
+        parserBar.hidden = true;
+        return;
+      }
+      for (const parser of parsers) {
+        const option = document.createElement("option");
+        option.value = parser.url;
+        option.textContent = parser.name;
+        parserSelect.append(option);
+      }
+      parserSelect.value = currentUrl;
+      parserBar.hidden = false;
+    }
+
+    parserSelect.addEventListener("change", () => {
+      const url = parserSelect.value;
+      if (!url) return;
+      embedPlayer.src = url;
+      reportPlayerLog("parser-switch", { parser: parserSelect.selectedOptions[0]?.textContent || "" });
+      playerStatus.textContent = `已切换到「${parserSelect.selectedOptions[0]?.textContent || "解析接口"}」`;
+    });
+
     async function attachPlayback(result) {
       const url = typeof result === "string" ? result : result?.url;
       if (typeof url !== "string" || !url) throw new Error("没有取得播放地址");
@@ -641,9 +675,8 @@
       });
 
       if (mode === "embed") {
-        if (!url.startsWith("https://player.youku.com/embed/")) {
-          throw new Error("服务端返回了不受信任的平台播放器地址");
-        }
+        const embedKind = result?.embed_kind || (url.startsWith("https://player.youku.com/embed/") ? "youku" : "");
+        if (!embedKind) throw new Error("服务端返回了不受信任的平台播放器地址");
         if (state.hls) { state.hls.destroy(); state.hls = null; }
         setSeekLoading(false, true);
         setPlayerLoading(false);
@@ -651,12 +684,25 @@
         player.removeAttribute("src");
         player.load();
         player.hidden = true;
+        if (embedKind === "parser") {
+          // 第三方解析页广告多，禁掉弹窗和顶层跳转，只留脚本执行
+          embedPlayer.setAttribute("sandbox", "allow-scripts allow-same-origin allow-presentation");
+        } else {
+          embedPlayer.removeAttribute("sandbox");
+        }
         embedPlayer.hidden = false;
         embedPlayer.src = url;
-        playerStatus.textContent = "已加载优酷官方播放器；如未自动播放，请点击画面中的播放按钮";
+        if (embedKind === "parser") {
+          renderParsers(Array.isArray(result?.parsers) ? result.parsers : [], url);
+          playerStatus.textContent = "该片源是平台网页，已交给解析接口播放；失败可在下方换一个解析接口";
+        } else {
+          playerStatus.textContent = "已加载优酷官方播放器；如未自动播放，请点击画面中的播放按钮";
+        }
         return;
       }
 
+      renderParsers([], "");
+      embedPlayer.removeAttribute("sandbox");
       embedPlayer.hidden = true;
       embedPlayer.removeAttribute("src");
       player.hidden = false;
