@@ -1383,6 +1383,40 @@ def probe_media_kind(url: str, headers: dict[str, Any]) -> str:
     return kind
 
 
+PARSER_HEALTH_TTL = 6 * 3600
+_PARSER_HEALTH: dict[str, tuple[float, bool, str]] = {}
+_PARSER_HEALTH_LOCK = threading.Lock()
+
+
+def _probe_parser(prefix: str, target: str) -> None:
+    """探一下解析接口是否还活着（域名过期、超时的直接标掉）。"""
+    alive, note = False, ""
+    try:
+        response = requests.get(
+            prefix + target,
+            headers={"User-Agent": BROWSER_UA},
+            timeout=(5, 12),
+            verify=False,
+            allow_redirects=True,
+        )
+        note = f"HTTP {response.status_code} {len(response.content)}B"
+        alive = response.status_code < 400 and len(response.content) >= 300
+    except requests.RequestException as exc:
+        note = type(exc).__name__
+    with _PARSER_HEALTH_LOCK:
+        _PARSER_HEALTH[prefix] = (time.time(), alive, note)
+    print(f"[parser-health] {'可用' if alive else '不可用'} {prefix} {note}", flush=True)
+
+
+def parser_alive(prefix: str) -> bool | None:
+    """True/False 为已探测结果，None 表示还没探过。"""
+    with _PARSER_HEALTH_LOCK:
+        entry = _PARSER_HEALTH.get(prefix)
+    if entry is None or time.time() - entry[0] > PARSER_HEALTH_TTL:
+        return None
+    return entry[1]
+
+
 def _parser_prefix_match(url: str) -> str:
     for parser in load_parsers():
         if url.startswith(parser["url"]):
@@ -1415,10 +1449,24 @@ def build_parser_embeds(url: str) -> tuple[str, list[dict[str, str]]]:
     target = _inner_page_target(url) if prefix else url
     if not target.startswith(("http://", "https://")):
         return "", []
-    embeds = [{"name": parser["name"], "url": parser["url"] + target} for parser in parsers]
-    if prefix:
-        # 插件已经指定了解析接口，保持它在第一位
-        embeds.sort(key=lambda item: 0 if item["url"].startswith(prefix) else 1)
+    embeds = []
+    for parser in parsers:
+        alive = parser_alive(parser["url"])
+        if alive is None:
+            _prefetch_pool().submit(_probe_parser, parser["url"], target)
+        embeds.append({
+            "name": parser["name"],
+            "url": parser["url"] + target,
+            "alive": alive,
+        })
+
+    def rank(item: dict[str, Any]) -> tuple[int, int]:
+        # 插件指定的接口永远排第一；其余按 可用 > 未知 > 已失效
+        preferred = 0 if prefix and item["url"].startswith(prefix) else 1
+        health = {True: 0, None: 1, False: 2}[item["alive"]]
+        return (preferred, health)
+
+    embeds.sort(key=rank)
     return target, embeds
 
 

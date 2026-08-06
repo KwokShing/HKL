@@ -84,6 +84,8 @@
     #player-status { min-height: 20px; margin: 4px 6px 0; color: var(--muted); font-size: 13px; }
     #parser-bar { display: flex; gap: 8px; align-items: center; margin: 8px 6px 0; color: var(--muted); font-size: 13px; }
     #parser-select { max-width: 220px; padding: 5px 8px; color: #e8e9f2; font: inherit; background: rgb(19 22 34 / 90%); border: 1px solid var(--line); border-radius: 8px; }
+    #parser-open { color: #a5b4fc; text-decoration: none; }
+    #parser-open:hover { text-decoration: underline; }
     .playback-info { min-width: 0; padding: 20px; background: linear-gradient(160deg, rgb(29 33 49 / 94%), rgb(19 22 34 / 90%)); border: 1px solid var(--line); border-radius: 17px; box-shadow: 0 20px 50px rgb(0 0 0 / 24%); backdrop-filter: blur(14px); }
     .summary { display: grid; grid-template-columns: 106px minmax(0, 1fr); gap: 16px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
     .summary > div { min-width: 0; max-height: clamp(170px, 24vh, 240px); padding-right: 8px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
@@ -145,6 +147,7 @@
           <p id="parser-bar" hidden>
             <label for="parser-select">解析接口</label>
             <select id="parser-select"></select>
+            <a id="parser-open" target="_blank" rel="noreferrer noopener">在新标签打开</a>
           </p>
         </section>
         <aside class="playback-info">
@@ -200,6 +203,7 @@
     const embedPlayer = element("embed-player");
     const parserBar = element("parser-bar");
     const parserSelect = element("parser-select");
+    const parserOpen = element("parser-open");
     const seekLoader = element("seek-loader");
     const playerStatus = element("player-status");
     let pointerDownWasPlaying = false;
@@ -638,15 +642,18 @@
       parserSelect.replaceChildren();
       if (parsers.length < 2) {
         parserBar.hidden = true;
+        parserOpen.removeAttribute("href");
         return;
       }
       for (const parser of parsers) {
         const option = document.createElement("option");
         option.value = parser.url;
-        option.textContent = parser.name;
+        // alive 为 false 表示服务端探测过、域名已失效
+        option.textContent = parser.alive === false ? `${parser.name} ✗` : parser.name;
         parserSelect.append(option);
       }
       parserSelect.value = currentUrl;
+      parserOpen.href = currentUrl;
       parserBar.hidden = false;
     }
 
@@ -654,6 +661,7 @@
       const url = parserSelect.value;
       if (!url) return;
       embedPlayer.src = url;
+      parserOpen.href = url;
       reportPlayerLog("parser-switch", { parser: parserSelect.selectedOptions[0]?.textContent || "" });
       playerStatus.textContent = `已切换到「${parserSelect.selectedOptions[0]?.textContent || "解析接口"}」`;
     });
@@ -687,8 +695,11 @@
         if (embedKind === "parser") {
           // 第三方解析页广告多，禁掉弹窗和顶层跳转，只留脚本执行
           embedPlayer.setAttribute("sandbox", "allow-scripts allow-same-origin allow-presentation");
+          // 部分解析接口会按 referer 区别对待（实测「解析3」带 iframe referer 时只回 388B）
+          embedPlayer.setAttribute("referrerpolicy", "no-referrer");
         } else {
           embedPlayer.removeAttribute("sandbox");
+          embedPlayer.setAttribute("referrerpolicy", "strict-origin-when-cross-origin");
         }
         embedPlayer.hidden = false;
         embedPlayer.src = url;
