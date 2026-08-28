@@ -26,7 +26,7 @@ class Spider(Spider):
             "name": "🐬自动加载",
             "key": "自动加载",
             "type": 3,
-            "api": "https://ghfast.top/https://raw.githubusercontent.com/FGBLH/HKL/refs/heads/main/py/自动加载66.py"
+            "api": "https://ghfast.top/https://raw.githubusercontent.com/FGBLH/EHR663/refs/heads/main/py/自动加载678.py"
          },
 		{
             "name": "🐬弹幕",
